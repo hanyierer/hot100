@@ -1,0 +1,491 @@
+可以做到**不改变原始业务代码**。
+
+你只需要**新增 2 个文件**：
+
+```text
+src/main/java/com/example/gamerag/runner/ConsoleRagRunner.java
+src/main/resources/application-console.yml
+```
+
+原来的这些文件都不用改：
+
+```text
+RagService.java
+RagController.java
+BgeEmbeddingClient.java
+BgeRerankerClient.java
+MilvusRetrievalService.java
+QueryUnderstandingService.java
+application.yml
+```
+
+------
+
+# 一、新增控制台运行类
+
+新建包：
+
+```text
+src/main/java/com/example/gamerag/runner
+```
+
+新建文件：
+
+```text
+ConsoleRagRunner.java
+```
+
+完整代码如下：
+
+```java
+package com.example.gamerag.runner;
+
+import com.example.gamerag.dto.RagQueryRequest;
+import com.example.gamerag.dto.RagQueryResponse;
+import com.example.gamerag.dto.ReferenceDto;
+import com.example.gamerag.service.RagService;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.CommandLineRunner;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.stereotype.Component;
+
+import java.nio.charset.StandardCharsets;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.Scanner;
+
+@Component
+@ConditionalOnProperty(prefix = "rag.console", name = "enabled", havingValue = "true")
+public class ConsoleRagRunner implements CommandLineRunner {
+
+    private final RagService ragService;
+
+    @Value("${rag.console.game-id:}")
+    private String gameId;
+
+    @Value("${rag.console.top-k:6}")
+    private Integer topK;
+
+    @Value("${rag.console.debug:false}")
+    private Boolean debug;
+
+    public ConsoleRagRunner(RagService ragService) {
+        this.ragService = ragService;
+    }
+
+    @Override
+    public void run(String... args) {
+        printWelcome();
+
+        Scanner scanner = new Scanner(System.in, StandardCharsets.UTF_8.name());
+
+        while (true) {
+            System.out.print("\nRAG> ");
+
+            if (!scanner.hasNextLine()) {
+                break;
+            }
+
+            String input = scanner.nextLine().trim();
+
+            if (input.isBlank()) {
+                continue;
+            }
+
+            if (isExit(input)) {
+                System.out.println("已退出控制台 RAG。");
+                break;
+            }
+
+            if (handleCommand(input)) {
+                continue;
+            }
+
+            ask(input);
+        }
+    }
+
+    private void ask(String query) {
+        try {
+            RagQueryRequest request = new RagQueryRequest();
+            request.setQuery(query);
+            request.setTopK(topK);
+            request.setDebug(debug);
+            request.setBypassCache(false);
+
+            if (gameId != null && !gameId.isBlank()) {
+                request.setGameId(gameId);
+            }
+
+            RagQueryResponse response = ragService.query(request);
+
+            printAnswer(response);
+            printReferences(response);
+
+            if (Boolean.TRUE.equals(debug)) {
+                printDebug(response);
+            }
+
+        } catch (Exception e) {
+            System.out.println("\n[ERROR] 调用失败：");
+            System.out.println(e.getMessage());
+            e.printStackTrace(System.out);
+        }
+    }
+
+    private boolean handleCommand(String input) {
+        if (input.equalsIgnoreCase(":help")) {
+            printHelp();
+            return true;
+        }
+
+        if (input.equalsIgnoreCase(":config")) {
+            printConfig();
+            return true;
+        }
+
+        if (input.startsWith(":game ")) {
+            this.gameId = input.substring(":game ".length()).trim();
+            System.out.println("已设置 gameId = " + this.gameId);
+            return true;
+        }
+
+        if (input.equalsIgnoreCase(":game clear")) {
+            this.gameId = "";
+            System.out.println("已清空 gameId");
+            return true;
+        }
+
+        if (input.startsWith(":topk ")) {
+            String value = input.substring(":topk ".length()).trim();
+            try {
+                int parsed = Integer.parseInt(value);
+                if (parsed <= 0 || parsed > 20) {
+                    System.out.println("topK 建议设置为 1 到 20");
+                } else {
+                    this.topK = parsed;
+                    System.out.println("已设置 topK = " + this.topK);
+                }
+            } catch (NumberFormatException e) {
+                System.out.println("topK 必须是整数，例如：:topk 6");
+            }
+            return true;
+        }
+
+        if (input.equalsIgnoreCase(":debug on")) {
+            this.debug = true;
+            System.out.println("已开启 debug");
+            return true;
+        }
+
+        if (input.equalsIgnoreCase(":debug off")) {
+            this.debug = false;
+            System.out.println("已关闭 debug");
+            return true;
+        }
+
+        return false;
+    }
+
+    private void printAnswer(RagQueryResponse response) {
+        System.out.println("\n==================== 回答 ====================");
+        System.out.println(nullToEmpty(response.getAnswer()));
+
+        System.out.println("\n缓存命中：" + response.isCacheHit());
+    }
+
+    private void printReferences(RagQueryResponse response) {
+        if (response.getReferences() == null || response.getReferences().isEmpty()) {
+            System.out.println("\n==================== 引用片段 ====================");
+            System.out.println("无引用片段");
+            return;
+        }
+
+        System.out.println("\n==================== 引用片段 ====================");
+
+        for (ReferenceDto ref : response.getReferences()) {
+            System.out.println("[" + ref.getIndex() + "] " + nullToEmpty(ref.getTitle()));
+            System.out.println("ID: " + nullToEmpty(ref.getId()));
+            System.out.println("Score: " + ref.getScore());
+
+            if (ref.getSource() != null && !ref.getSource().isBlank()) {
+                System.out.println("Source: " + ref.getSource());
+            }
+
+            if (ref.getUrl() != null && !ref.getUrl().isBlank()) {
+                System.out.println("URL: " + ref.getUrl());
+            }
+
+            if (ref.getSnippet() != null && !ref.getSnippet().isBlank()) {
+                System.out.println("Snippet: " + ref.getSnippet());
+            }
+
+            System.out.println();
+        }
+    }
+
+    private void printDebug(RagQueryResponse response) {
+        System.out.println("\n==================== Debug ====================");
+
+        if (response.getQueryAnalysis() != null) {
+            System.out.println("Intent: " + response.getQueryAnalysis().getIntent());
+            System.out.println("Strategy: " + response.getQueryAnalysis().getStrategy());
+            System.out.println("RewrittenQuery: " + response.getQueryAnalysis().getRewrittenQuery());
+            System.out.println("ExpandedQueries: " + response.getQueryAnalysis().getExpandedQueries());
+            System.out.println("Keywords: " + response.getQueryAnalysis().getKeywords());
+            System.out.println("Entities: " + response.getQueryAnalysis().getEntities());
+            System.out.println("Filters: " + response.getQueryAnalysis().getFilters());
+        }
+
+        if (response.getDebug() != null && !response.getDebug().isEmpty()) {
+            System.out.println("DebugInfo: " + response.getDebug());
+        }
+    }
+
+    private void printWelcome() {
+        System.out.println("==================================================");
+        System.out.println("游戏知识库 RAG 控制台模式");
+        System.out.println("输入问题后回车即可检索和生成答案。");
+        System.out.println();
+        System.out.println("常用命令：");
+        System.out.println("  :help          查看帮助");
+        System.out.println("  :config        查看当前配置");
+        System.out.println("  :game xxx      设置 gameId");
+        System.out.println("  :game clear    清空 gameId");
+        System.out.println("  :topk 6        设置最终引用片段数量");
+        System.out.println("  :debug on      开启 debug 输出");
+        System.out.println("  :debug off     关闭 debug 输出");
+        System.out.println("  exit / quit    退出");
+        System.out.println("==================================================");
+        printConfig();
+    }
+
+    private void printHelp() {
+        System.out.println("\n命令说明：");
+        System.out.println("  直接输入问题：例如 黑龙第二阶段怎么打？");
+        System.out.println("  :game demo_game    设置当前游戏 ID");
+        System.out.println("  :topk 8            设置返回引用片段数量");
+        System.out.println("  :debug on          输出 Query 理解、检索计划、召回数量等信息");
+        System.out.println("  exit               退出程序");
+    }
+
+    private void printConfig() {
+        Map<String, Object> config = new LinkedHashMap<>();
+        config.put("gameId", gameId);
+        config.put("topK", topK);
+        config.put("debug", debug);
+
+        System.out.println("\n当前控制台配置：");
+        config.forEach((k, v) -> System.out.println("  " + k + " = " + v));
+    }
+
+    private boolean isExit(String input) {
+        return "exit".equalsIgnoreCase(input)
+                || "quit".equalsIgnoreCase(input)
+                || ":exit".equalsIgnoreCase(input)
+                || ":quit".equalsIgnoreCase(input);
+    }
+
+    private String nullToEmpty(String value) {
+        return value == null ? "" : value;
+    }
+}
+```
+
+------
+
+# 二、新增控制台专用配置文件
+
+新建文件：
+
+```text
+src/main/resources/application-console.yml
+```
+
+完整内容如下：
+
+```yaml
+spring:
+  main:
+    web-application-type: none
+
+rag:
+  console:
+    enabled: true
+    game-id: demo_game
+    top-k: 6
+    debug: true
+```
+
+这里的作用是：
+
+```yaml
+spring:
+  main:
+    web-application-type: none
+```
+
+表示**不启动 Web 服务**，也就是不启动 8080 端口。
+
+```yaml
+rag:
+  console:
+    enabled: true
+```
+
+表示启用你刚才新增的 `ConsoleRagRunner`。
+
+------
+
+# 三、启动控制台模式
+
+## Windows CMD
+
+```bat
+chcp 65001
+
+java -Dfile.encoding=UTF-8 -jar target/game-rag-online-1.0.0.jar --spring.profiles.active=console
+```
+
+## Windows PowerShell
+
+```powershell
+$env:JAVA_TOOL_OPTIONS="-Dfile.encoding=UTF-8"
+
+java -jar target/game-rag-online-1.0.0.jar --spring.profiles.active=console
+```
+
+## IDEA 里运行
+
+在 Run Configuration 里配置：
+
+```text
+Program arguments:
+--spring.profiles.active=console
+```
+
+或者：
+
+```text
+VM options:
+-Dfile.encoding=UTF-8
+```
+
+------
+
+# 四、使用效果
+
+启动后控制台会显示：
+
+```text
+==================================================
+游戏知识库 RAG 控制台模式
+输入问题后回车即可检索和生成答案。
+
+常用命令：
+  :help          查看帮助
+  :config        查看当前配置
+  :game xxx      设置 gameId
+  :game clear    清空 gameId
+  :topk 6        设置最终引用片段数量
+  :debug on      开启 debug 输出
+  :debug off     关闭 debug 输出
+  exit / quit    退出
+==================================================
+
+当前控制台配置：
+  gameId = demo_game
+  topK = 6
+  debug = true
+
+RAG>
+```
+
+然后你可以直接输入：
+
+```text
+黑龙第二阶段怎么打？
+```
+
+输出类似：
+
+```text
+==================== 回答 ====================
+第二阶段需要先处理召唤物，然后观察 Boss 的蓄力动作……
+
+缓存命中：false
+
+==================== 引用片段 ====================
+[1] 黑龙 Boss 攻略
+ID: chunk_001
+Score: 0.91
+Source: wiki/boss.md
+Snippet: 黑龙进入第二阶段后，会释放范围火焰技能……
+
+[2] 黑龙机制说明
+ID: chunk_002
+Score: 0.87
+Source: guide/boss.md
+Snippet: 第二阶段的关键机制是……
+```
+
+------
+
+# 五、如果不想新建 `application-console.yml`
+
+也可以完全不加配置文件，启动时直接传参数：
+
+```bash
+java -Dfile.encoding=UTF-8 -jar target/game-rag-online-1.0.0.jar \
+  --spring.main.web-application-type=none \
+  --rag.console.enabled=true \
+  --rag.console.game-id=demo_game \
+  --rag.console.top-k=6 \
+  --rag.console.debug=true
+```
+
+Windows CMD 写成一行：
+
+```bat
+java -Dfile.encoding=UTF-8 -jar target/game-rag-online-1.0.0.jar --spring.main.web-application-type=none --rag.console.enabled=true --rag.console.game-id=demo_game --rag.console.top-k=6 --rag.console.debug=true
+```
+
+------
+
+# 六、是否改变了原始代码？
+
+不改变原始代码。
+
+你只是新增：
+
+```text
+ConsoleRagRunner.java
+application-console.yml
+```
+
+原来的后端接口仍然可以继续用：
+
+```text
+POST /api/rag/query
+```
+
+以后你想切回前后端模式，只要正常启动：
+
+```bash
+java -jar target/game-rag-online-1.0.0.jar
+```
+
+想用控制台模式，就启动：
+
+```bash
+java -jar target/game-rag-online-1.0.0.jar --spring.profiles.active=console
+```
+
+所以最终是：
+
+```text
+普通模式：Spring Boot Web 后端接口
+控制台模式：CommandLineRunner 命令行问答
+```
+
+两套模式共用同一个 `RagService`，不会破坏原有结构。
