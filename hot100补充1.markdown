@@ -1,0 +1,656 @@
+# hot100补充1
+
+## [49. 字母异位词分组](https://leetcode.cn/problems/group-anagrams/)
+
+```python
+from collections import defaultdict
+from typing import List
+class Solution:
+    def groupAnagrams(self, strs: List[str]) -> List[List[str]]:
+        dict = defaultdict(list)
+        for s in strs:
+            key = "".join(sorted(s))
+            dict[key].append(s)
+        return list(dict.values())
+```
+
+## [108. 将有序数组转换为二叉搜索树](https://leetcode.cn/problems/convert-sorted-array-to-binary-search-tree/)
+
+自己写的（2026年3月2日 10:12:59）
+
+```python
+class Solution:
+    def sortedArrayToBST(self, nums: List[int]) -> Optional[TreeNode]:
+        def shu(nums: List[int], l, r):
+            if l > r:
+                return None
+            mid = (l + r) // 2
+            node = TreeNode(nums[mid])
+            node.left = shu(nums, l, mid - 1)
+            node.right = shu(nums, mid + 1, r)
+            return node
+        return shu(nums, 0, len(nums) - 1)
+```
+
+## [994. 腐烂的橘子](https://leetcode.cn/problems/rotting-oranges/)
+
+自己写的（2026年4月18日 ）
+
+```python
+from collections import deque
+from typing import List
+class Solution:
+    def orangesRotting(self, grid: List[List[int]]) -> int:
+        m = len(grid)
+        n = len(grid[0])
+        n1 = 0
+        n2 = 0
+        dq = deque()
+        for i in range(m):
+            for j in range(n):
+                if grid[i][j] == 2:
+                    n2 += 1
+                    dq.append([i, j])
+                    grid[i][j] = 2
+                if grid[i][j] == 1:
+                    n1 += 1
+        if n1 == 0:
+            return 0
+        if n2 == 0:
+            return -1
+        self.count = 0
+        dir = [[0, 1], [1, 0], [-1, 0], [0, -1]]
+        while dq:
+            for i in range(len(dq)):
+                x, y = dq.popleft()
+                for cur in dir:
+                    p = cur[0] + x
+                    q = cur[1] + y
+                    if 0 <= p < m and 0 <= q < n and grid[p][q] == 1:
+                        n1 -= 1
+                        dq.append([p, q])
+                        grid[p][q] = 2
+            if dq: # 放在后面
+                self.count += 1
+        if n1 == 0:
+            return self.count
+        else:
+            return -1
+```
+
+## [207. 课程表](https://leetcode.cn/problems/course-schedule/)
+
+自己写的
+
+```python
+class Solution:
+    def canFinish(self, numCourses: int, prerequisites: List[List[int]]) -> bool:
+        
+        graph = defaultdict(list)
+        indegree = [0] * numCourses
+        for x, y in prerequisites:
+            graph[y].append(x)
+            indegree[x] += 1
+        
+        dq = deque()
+        for i in range(numCourses):
+            if indegree[i] == 0:# 初始化双端队列
+                dq.append(i)
+        
+        count = 0
+        while dq:
+            l = len(dq)
+            for i in range(l):
+                cur = dq.popleft()
+                count += 1
+                for x in graph[cur]:
+                    indegree[x] -= 1
+                    if indegree[x] == 0:# 入队
+                        dq.append(x)
+        return count == numCourses
+```
+
+## [42. 接雨水](https://leetcode.cn/problems/trapping-rain-water/)
+
+自己写的（2026年3月2日 22:23:15）
+
+在双指针里 **不需要用 min(l_max, r_max)**，应该用“较低一侧的 max - 当前高度”。
+
+双指针法的关键是：
+
+- 如果 `height[l] < height[r]`，说明左侧这格的右边界一定够高，**只看 `l_max`**
+- 否则只看 `r_max`
+
+```python
+class Solution:
+    def trap(self, height: List[int]) -> int:
+        l_max = 0
+        r_max = 0
+        l = 0
+        r = len(height) - 1
+        result = 0
+        while l <= r:
+            if height[l] < height[r]:# 左侧这格的右边界一定够高，**只看 `l_max`**
+                if l_max <= height[l]:
+                    l_max = max(l_max, height[l])# 太高了，不加。直接更新左边最大值
+                else:
+                    result += l_max - height[l]# 低， 直接加到结果
+                l += 1 # 别忘更新 短的一侧 指针
+            else:
+                if r_max <= height[r]:
+                    r_max = max(height[r], r_max)
+                else:
+                    result += r_max - height[r]
+                r -= 1
+        return result
+```
+
+```python
+from typing import List
+
+class Solution:
+    def trap(self, height: List[int]) -> int:
+        left, right = 0, len(height) - 1
+        left_max, right_max = 0, 0
+        ans = 0
+
+        while left < right:
+            if height[left] < height[right]:
+                if height[left] >= left_max:
+                    left_max = height[left]
+                else:
+                    ans += left_max - height[left]
+                left += 1
+            else:
+                if height[right] >= right_max:
+                    right_max = height[right]
+                else:
+                    ans += right_max - height[right]
+                right -= 1
+
+        return ans
+```
+
+```
+height = [4,2,0,3,2,5]
+```
+
+看位置 `1`，高度是 `2`：
+
+- 左边最大值是 `4`
+- 右边最大值是 `5`
+
+所以这里能接：
+
+```
+min(4, 5) - 2 = 2
+```
+
+看位置 `2`，高度是 `0`：
+
+```
+min(4, 5) - 0 = 4
+```
+
+最后总和是 `9`。
+
+## [438. 找到字符串中所有字母异位词](https://leetcode.cn/problems/find-all-anagrams-in-a-string/)
+
+官方题解（2026年3月7日 23:05:51）
+
+```python
+class Solution:
+    def findAnagrams(self, s: str, p: str) -> List[int]:
+        s_len, p_len = len(s), len(p)
+        
+        if s_len < p_len:
+            return []
+
+        ans = []
+        s_count = [0] * 26
+        p_count = [0] * 26
+        for i in range(p_len):
+            s_count[ord(s[i]) - 97] += 1
+            p_count[ord(p[i]) - 97] += 1
+
+        if s_count == p_count:
+            ans.append(0)
+
+        for i in range(s_len - p_len):
+            s_count[ord(s[i]) - 97] -= 1
+            s_count[ord(s[i + p_len]) - 97] += 1
+            
+            if s_count == p_count:
+                ans.append(i + 1)
+
+        return ans
+```
+
+## [105. 从前序与中序遍历序列构造二叉树](https://leetcode.cn/problems/construct-binary-tree-from-preorder-and-inorder-traversal/)
+
+自己写的（2026年3月2日 23:42:38）
+
+```python
+class Solution:
+    def buildTree(self, preorder: List[int], inorder: List[int]) -> Optional[TreeNode]:
+        mp = {}
+        for i, c in enumerate(inorder):
+            mp[c] = i
+        
+        def build(l, r, p, q):
+            if p > q:
+                return None
+            root = TreeNode(preorder[l])
+            i = mp[preorder[l]]
+            root.left = build(l + 1, l + i - p, p, i - 1)
+            root.right = build(l + i - p + 1, r, i + 1, q)
+            return root
+        return build(0, len(preorder) - 1, 0, len(inorder) - 1)
+```
+
+## [236. 二叉树的最近公共祖先](https://leetcode.cn/problems/lowest-common-ancestor-of-a-binary-tree/)
+
+```python
+class Solution:
+    def lowestCommonAncestor(self, root: 'TreeNode', p: 'TreeNode', q: 'TreeNode') -> 'TreeNode':
+        
+        if not root or root == p or root == q:
+            return root
+        
+        l = self.lowestCommonAncestor(root.left, p, q)
+        r = self.lowestCommonAncestor(root.right, p, q)
+        if l and r:
+            return root
+        return l if l else r
+```
+
+## [131. 分割回文串](https://leetcode.cn/problems/palindrome-partitioning/)
+
+```python
+from typing import List
+
+
+class Solution:
+    def partition(self, s: str) -> List[List[str]]:
+        path = []
+        result = []
+        n = len(s)
+
+        def bt(s, start_index, n):
+
+            if start_index == n:
+                result.append(path[:])
+                return
+            for i in range(start_index, n):
+                if self.judge(s, start_index, i):
+                    path.append(s[start_index: i + 1])
+                    bt(s, i + 1, n)
+                    path.pop()
+        bt(s, 0, n)
+        return result
+    def judge(self, s, l, r):
+        while l < r:
+            if s[l] != s[r]:
+                return False
+            l += 1
+            r -= 1
+        return True
+```
+
+```python
+bt(start=0, path=[])
+├─ i=0: "a" 是回文 → path=["a"]
+│  └─ bt(start=1, path=["a"])
+│     ├─ i=1: "a" 是回文 → path=["a","a"]
+│     │  └─ bt(start=2, path=["a","a"])
+│     │     ├─ i=2: "b" 是回文 → path=["a","a","b"]
+│     │     │  └─ bt(start=3, path=["a","a","b"]) → 满足条件，添加 ["a","a","b"]，返回
+│     │     └─ 回溯，弹出 "b"，path=["a","a"]
+│     │  ← bt(start=2) 返回
+│     │  回溯，弹出第二个 "a"，path=["a"]
+│     ├─ i=2: "ab" 不是回文，跳过
+│     └─ bt(start=1) 返回，弹出第一个 "a"，path=[]
+├─ i=1: "aa" 是回文 → path=["aa"]
+│  └─ bt(start=2, path=["aa"])
+│     ├─ i=2: "b" 是回文 → path=["aa","b"]
+│     │  └─ bt(start=3, path=["aa","b"]) → 添加 ["aa","b"]，返回
+│     └─ 回溯，弹出 "b"，path=["aa"]
+│  ← bt(start=2) 返回
+│  回溯，弹出 "aa"，path=[]
+├─ i=2: "aab" 不是回文，跳过
+└─ bt(start=0) 返回
+
+最终结果： [["a","a","b"], ["aa","b"]]
+```
+
+## [98. 验证二叉搜索树](https://leetcode.cn/problems/validate-binary-search-tree/)
+
+**官方题解**
+
+要解决这道题首先我们要了解二叉搜索树有什么性质可以给我们利用，由题目给出的信息我们可以知道：如果该二叉树的左子树不为空，则左子树上所有节点的值均小于它的根节点的值； 若它的右子树不空，则右子树上所有节点的值均大于它的根节点的值；它的左右子树也为二叉搜索树。
+
+这启示我们设计一个递归函数 helper(root, lower, upper) 来递归判断，函数表示考虑以 root 为根的子树，判断子树中所有节点的值是否都在 (l,r) 的范围内（注意是开区间）。如果 root 节点的值 val 不在 (l,r) 的范围内说明不满足条件直接返回，否则我们要继续递归调用检查它的左右子树是否满足，如果都满足才说明这是一棵二叉搜索树。
+
+那么根据二叉搜索树的性质，在递归调用**左子树**时，我们需要把**上界 upper** 改为 **root.val**，即调用 helper(root.left, lower, root.val)，因为左子树里所有节点的值均小于它的根节点的值。同理递归调用**右子树**时，我们需要把**下界 lower** 改为 **root.val**，即调用 helper(root.right, root.val, upper)。
+
+函数递归调用的入口为 helper(root, -inf, +inf)， inf 表示一个无穷大的值。
+
+<img src="C:\Users\HanYi\AppData\Roaming\Typora\typora-user-images\image-20260303193747970.png" alt="image-20260303193747970" style="zoom: 50%;" />
+
+<img src="C:\Users\HanYi\AppData\Roaming\Typora\typora-user-images\image-20260303193827421.png" alt="image-20260303193827421" style="zoom:50%;" />
+
+<img src="C:\Users\HanYi\AppData\Roaming\Typora\typora-user-images\image-20260303193841400.png" alt="image-20260303193841400" style="zoom:50%;" />
+
+<img src="C:\Users\HanYi\AppData\Roaming\Typora\typora-user-images\image-20260303193856099.png" alt="image-20260303193856099" style="zoom:50%;" />
+
+自己写的（2026年3月3日 19:50:53）
+
+```python
+class Solution:
+    def isValidBST(self, root: Optional[TreeNode]) -> bool:
+        def check(root, left, right):
+            if not root:
+                return True
+            v = root.val
+            if v <= left or v >= right:
+                return False
+            return check(root.left, left, v) and check(root.right, root.val, right)
+        return check(root, float('-inf'), float('inf'))
+```
+
+## [230. 二叉搜索树中第 K 小的元素](https://leetcode.cn/problems/kth-smallest-element-in-a-bst/)
+
+二叉搜索树（BST）具有重要性质：**中序遍历得到的是递增序列**。因此，要找到第 k 小的元素，只需对 BST 进行中序遍历，并在遍历过程中计数，当计数达到 k 时，当前节点即为答案。
+
+方法一：递归中序遍历（提前终止）
+
+- 使用递归进行中序遍历，维护一个全局计数器和一个结果变量。
+- 遍历左子树、访问根节点、遍历右子树。当访问根节点时，计数器加 1，若等于 k 则记录结果并返回（可提前终止递归）。
+
+代码实现（递归 + 提前终止）
+
+```python
+class Solution:
+    def kthSmallest(self, root: Optional[TreeNode], k: int) -> int:
+        self.count = 0
+        self.result = None
+
+        def inorder(node):
+            if not node or self.result is not None:
+                return
+            inorder(node.left)
+            self.count += 1
+            if self.count == k:
+                self.result = node.val
+                return
+            inorder(node.right)
+
+        inorder(root)
+        return self.result
+```
+
+<img src="C:\Users\HanYi\AppData\Roaming\Typora\typora-user-images\image-20260303200247249.png" alt="image-20260303200247249" style="zoom:50%;" />
+
+```python
+inorder(5)  // 调用根节点
+├─ inorder(3)          // 进入左子树
+│  ├─ inorder(2)       // 进入左子树的左子树
+│  │  ├─ inorder(1)    // 进入左子树的左子树的左子树
+│  │  │  ├─ inorder(1.left) → None (返回)
+│  │  │  ├─ 处理节点1: count=1 (≠3)
+│  │  │  ├─ inorder(1.right) → None (返回)
+│  │  │  └─ inorder(1) 返回
+│  │  ├─ 处理节点2: count=2 (≠3)
+│  │  ├─ inorder(2.right) → None (返回)
+│  │  └─ inorder(2) 返回
+│  ├─ 处理节点3: count=3 → 找到结果，result=3，直接返回（不再递归右子树）
+│  └─ inorder(3) 返回
+├─ 发现 result 已赋值，直接返回（不再处理节点5和右子树）
+└─ inorder(5) 返回
+```
+
+## [3. 无重复字符的最长子串](https://leetcode.cn/problems/longest-substring-without-repeating-characters/)
+
+核心思路（滑动窗口 + **哈希表**）
+
+要找最长子串，使得子串内**没有重复字符**。经典做法是滑动窗口：
+
+- 用两个指针 `l, r` 表示当前窗口 `[l, r]`
+- 用哈希表 `last` 记录每个字符**最近一次出现的位置**
+- 当遍历到 `s[r] = ch`：
+  - 如果 `ch` 在窗口内出现过（即 `last[ch] >= l`），说明重复了→ 把左边界 `l` 直接跳到 `last[ch] + 1`
+  - 更新 `last[ch] = r`
+  - 更新答案 `ans = max(ans, r - l + 1)`
+
+关键点：`l` 只能向右移动，且一次跳跃到位，整体 `O(n)`。
+
+```python
+class Solution:
+    def lengthOfLongestSubstring(self, s: str) -> int:
+        last = {}   # 记录字符最近一次出现的下标
+        l = 0       # 滑动窗口左边界
+        ans = 0
+        for r, ch in enumerate(s):
+            # 如果 ch 在当前窗口 [l, r-1] 内出现过，移动左边界
+            if ch in last and last[ch] >= l:
+                l = last[ch] + 1
+            # 更新 ch 最近出现位置
+            last[ch] = r
+            # 更新最大长度
+            ans = max(ans, r - l + 1)
+        return ans
+```
+
+## [76. 最小覆盖子串](https://leetcode.cn/problems/minimum-window-substring/)
+
+```python
+from collections import Counter, defaultdict
+class Solution:
+    def minWindow(self, s: str, t: str) -> str:
+        need = Counter(t) # 统计需要的t
+        window = defaultdict(int)
+        count = len(need)
+        left = 0
+        start = 0
+        valid = 0
+        min_len = float('inf') # 防止重名
+        for i, ch in enumerate(s):
+            if ch in need:
+                window[ch] += 1
+                if window[ch] == need[ch]:
+                    valid += 1
+            
+            while valid == count:# 收缩左边界
+                if i - left + 1 < min_len: # 更新结果
+                    start = left
+                    min_len = i - left + 1
+                d = s[left]
+                left += 1
+                if d in need:# 
+                    if window[d] == need[d]:
+                        valid -= 1
+                	window[d] -= 1
+        if min_len == float('inf'):
+            return ""
+        return s[start:start + min_len]
+```
+
+## [25. K 个一组翻转链表](https://leetcode.cn/problems/reverse-nodes-in-k-group/)
+
+官方题解
+
+```python
+class Solution:
+    # 翻转一个子链表，并且返回新的头与尾
+    def reverse(self, head: ListNode, tail: ListNode):
+        prev = tail.next
+        p = head
+        while prev != tail:
+            nex = p.next
+            p.next = prev
+            prev = p
+            p = nex
+        return tail, head
+
+    def reverseKGroup(self, head: ListNode, k: int) -> ListNode:
+        hair = ListNode(0)
+        hair.next = head
+        pre = hair
+        while head:# 用head当指针 # 里面有 11 行
+            tail = pre
+            # 查看剩余部分长度是否大于等于 k
+            for i in range(k):
+                tail = tail.next
+                if not tail:
+                    return hair.next
+            nex = tail.next
+            head, tail = self.reverse(head, tail)
+            # 把子链表重新接回原链表
+            pre.next = head
+            tail.next = nex
+            pre = tail
+            head = tail.next
+        return hair.next
+```
+
+## [199. 二叉树的右视图](https://leetcode.cn/problems/binary-tree-right-side-view/)
+
+```python
+from typing import Optional, List
+class Solution:
+    def rightSideView(self, root: Optional[TreeNode]) -> List[int]:
+        res = []
+        def dfs(root: Optional[TreeNode], depth):
+            if not root:
+                return
+            if depth == len(res):
+                res.append(root.val)
+            dfs(root.right, depth + 1)# 先右后左
+            dfs(root.left, depth + 1)
+        dfs(root, 0)
+        return res
+```
+
+## [79. 单词搜索](https://leetcode.cn/problems/word-search/)
+
+1. **回溯法的应用**：
+   - 从每个单元格开始，尝试在四个方向（上、下、左、右）查找单词。
+   - 一旦找到单词的某一部分，继续从下一个字符开始查找，直到整个单词都被找到。
+   - 每个单元格只能使用一次，因此需要**在每次回溯前标记已访问的单元格，回溯时再恢复标记**。
+2. **回溯法的步骤**：
+   - 遍历每一个单元格，尝试将其作为起点。
+   - 对于每个字符，检查它是否和当前字符匹配，如果匹配，则继续在周围的四个方向进行搜索。
+   - 如果搜索到字符串的末尾，说明找到了该单词，返回 `True`。
+   - 如果无法继续搜索，返回 `False`。
+
+```python
+from typing import List
+class Solution:
+    def exist(self, board: List[List[str]], word: str) -> bool:
+        m = len(board)
+        n = len(board[0])
+        l = len(word)
+        def dfs(start_index, i, j, l):
+            if i < 0 or i > m - 1 or j < 0 or j > n - 1 or word[start_index] != board[i][j]:
+                return False
+            if start_index == l - 1:
+                return True
+            temp = board[i][j]
+            board[i][j] = "#"
+            result = dfs(start_index + 1, i - 1, j, l) or dfs(start_index + 1, i, j - 1, l) or dfs(start_index + 1,i + 1, j, l) or dfs(start_index + 1, i, j + 1, l)
+            board[i][j] = temp
+            return result
+        for i in range(m):
+            for j in range(n):
+                if dfs(0, i, j, l):
+                    return True
+        return False
+
+```
+
+**`backtrack(i, j, index)`**：
+
+- `i` 和 `j` 表示当前的单元格位置。
+- `index` 表示我们正在寻找的单词的字符索引。
+- 首先检查当前位置是否越界，或者该位置的字符是否与当前的字符不匹配。
+- 如果匹配，继续往四个方向进行回溯（上下左右）。
+- 如果当前字符是单词的最后一个字符，说明找到了整个单词，返回 `True`。
+- 如果没有找到，恢复当前位置的字符，并返回 `False`。
+
+## [131. 分割回文串](https://leetcode.cn/problems/palindrome-partitioning/)
+
+代码随想录  自己写的（2026年4月20日 21:46:02）
+
+```python
+from typing import List
+class Solution:
+    def partition(self, s: str) -> List[List[str]]:
+        path = []
+        result = []
+        n = len(s)
+        def bt(s, start_index, n):
+            if start_index == n:
+                result.append(path[:])
+                return
+            for i in range(start_index, n):
+                if self.judge(s, start_index, i):
+                    path.append(s[start_index: i + 1])
+                    bt(s, i + 1, n)
+                    path.pop()
+        bt(s, 0, n)
+        return result
+    def judge(self, s, l, r):
+        while l < r:
+            if s[l] != s[r]:
+                return False
+            l += 1
+            r -= 1
+        return True
+```
+
+## [51. N 皇后](https://leetcode.cn/problems/n-queens/)
+
+代码随想录
+
+```python
+class Solution:
+    def solveNQueens(self, n: int) -> List[List[str]]:
+        result = []  # 存储最终结果的二维字符串数组
+        chessboard = ['.' * n for _ in range(n)]  # 初始化棋盘
+        # 输出：['....', '....', '....', '....']
+        self.backtracking(n, 0, chessboard, result)
+        return result
+
+    def backtracking(self, n: int, row: int, chessboard: List[str], result: List[List[str]]) -> None:
+        if row == n:
+            result.append(chessboard[:]) 
+            return
+
+        for col in range(n):
+            if self.isValid(row, col, chessboard): 
+                chessboard[row] = chessboard[row][:col] + 'Q' + chessboard[row][col+1:] 
+                self.backtracking(n, row + 1, chessboard, result) 
+                chessboard[row] = chessboard[row][:col] + '.' + chessboard[row][col+1:] 
+
+    def isValid(self, row: int, col: int, chessboard: List[str]) -> bool:
+        # 检查列
+        for i in range(row):
+            if chessboard[i][col] == 'Q':
+                return False
+        # 检查 45 度角
+        i, j = row - 1, col - 1
+        while i >= 0 and j >= 0:
+            if chessboard[i][j] == 'Q':
+                return False
+            i -= 1
+            j -= 1
+
+        # 检查 135 度角
+        i, j = row - 1, col + 1
+        while i >= 0 and j < len(chessboard):
+            if chessboard[i][j] == 'Q':
+                return False 
+            i -= 1
+            j += 1
+        return True
+```
