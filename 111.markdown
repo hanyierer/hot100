@@ -1,0 +1,157 @@
+import io.milvus.v2.client.ConnectConfig;
+import io.milvus.v2.client.MilvusClientV2;
+import io.milvus.v2.common.ConsistencyLevel;
+import io.milvus.v2.service.collection.request.HasCollectionReq;
+import io.milvus.v2.service.collection.request.LoadCollectionReq;
+import io.milvus.v2.service.vector.request.SearchReq;
+import io.milvus.v2.service.vector.request.data.FloatVec;
+import io.milvus.v2.service.vector.response.SearchResp;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
+
+public class MilvusSearchExample {
+
+    private static final String MILVUS_URI = "http://localhost:19530";
+    private static final String MILVUS_TOKEN = "root:Milvus";
+    
+    private static final String COLLECTION_NAME = "java_milvus_crud_demo";
+    
+    private static final String FIELD_ID = "id";
+    private static final String FIELD_TITLE = "title";
+    private static final String FIELD_CONTENT = "content";
+    private static final String FIELD_VECTOR = "content_vector";
+    
+    private static final int VECTOR_DIM = 512;
+    
+    public static void main(String[] args) {
+        MilvusClientV2 client = createClient();
+    
+        try {
+            checkCollectionExists(client);
+    
+            loadCollection(client);
+    
+            // 生成 512 维模拟查询向量
+            List<Float> queryVector = randomVector(VECTOR_DIM);
+    
+            // 向量相似度搜索
+            searchTopK(client, queryVector, 5);
+    
+            // 带过滤条件的向量搜索
+            searchTopKWithFilter(client, queryVector, 5, "id >= 1");
+    
+        } finally {
+            client.close();
+        }
+    }
+    
+    private static MilvusClientV2 createClient() {
+        ConnectConfig connectConfig = ConnectConfig.builder()
+                .uri(MILVUS_URI)
+                .token(MILVUS_TOKEN)
+                .build();
+    
+        return new MilvusClientV2(connectConfig);
+    }
+    
+    private static void checkCollectionExists(MilvusClientV2 client) {
+        Boolean exists = client.hasCollection(
+                HasCollectionReq.builder()
+                        .collectionName(COLLECTION_NAME)
+                        .build()
+        );
+    
+        if (!exists) {
+            throw new RuntimeException(
+                    "集合不存在：" + COLLECTION_NAME + "。请先运行 MilvusCrudExample.java 初始化并插入数据。"
+            );
+        }
+    }
+    
+    private static void loadCollection(MilvusClientV2 client) {
+        client.loadCollection(
+                LoadCollectionReq.builder()
+                        .collectionName(COLLECTION_NAME)
+                        .build()
+        );
+    
+        System.out.println("集合已加载：" + COLLECTION_NAME);
+    }
+    
+    private static void searchTopK(MilvusClientV2 client, List<Float> queryVector, int topK) {
+        SearchReq searchReq = SearchReq.builder()
+                .collectionName(COLLECTION_NAME)
+                .annsField(FIELD_VECTOR)
+                .data(Collections.singletonList(new FloatVec(queryVector)))
+                .topK(topK)
+                .outputFields(Arrays.asList(FIELD_ID, FIELD_TITLE, FIELD_CONTENT))
+                .consistencyLevel(ConsistencyLevel.STRONG)
+                .build();
+    
+        SearchResp searchResp = client.search(searchReq);
+    
+        System.out.println("普通向量搜索结果：");
+        printSearchResult(searchResp);
+    }
+    
+    private static void searchTopKWithFilter(
+            MilvusClientV2 client,
+            List<Float> queryVector,
+            int topK,
+            String filter
+    ) {
+        SearchReq searchReq = SearchReq.builder()
+                .collectionName(COLLECTION_NAME)
+                .annsField(FIELD_VECTOR)
+                .data(Collections.singletonList(new FloatVec(queryVector)))
+                .topK(topK)
+                .filter(filter)
+                .outputFields(Arrays.asList(FIELD_ID, FIELD_TITLE, FIELD_CONTENT))
+                .consistencyLevel(ConsistencyLevel.STRONG)
+                .build();
+    
+        SearchResp searchResp = client.search(searchReq);
+    
+        System.out.println("带过滤条件的向量搜索结果，filter = " + filter);
+        printSearchResult(searchResp);
+    }
+    
+    private static void printSearchResult(SearchResp searchResp) {
+        List<List<SearchResp.SearchResult>> searchResults = searchResp.getSearchResults();
+    
+        for (List<SearchResp.SearchResult> oneQueryResults : searchResults) {
+            for (SearchResp.SearchResult result : oneQueryResults) {
+                System.out.println("-----------------------------");
+                System.out.println("ID: " + result.getId());
+                System.out.println("Score: " + result.getScore());
+                System.out.println("Entity: " + result.getEntity());
+            }
+        }
+    }
+    
+    private static List<Float> randomVector(int dim) {
+        List<Float> vector = new ArrayList<>(dim);
+        double sum = 0.0;
+    
+        for (int i = 0; i < dim; i++) {
+            float value = (float) Math.random();
+            vector.add(value);
+            sum += value * value;
+        }
+    
+        double norm = Math.sqrt(sum);
+        if (norm == 0) {
+            return vector;
+        }
+    
+        for (int i = 0; i < dim; i++) {
+            vector.set(i, (float) (vector.get(i) / norm));
+        }
+    
+        return vector;
+    }
+}
+
