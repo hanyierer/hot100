@@ -1,0 +1,2015 @@
+下面我把你这里的“质检所部分”按 **RAG 游戏系统的检索部分** 来理解：用户输入一个问题后，系统先生成多个 Query 变形，例如原始 Query、改写 Query、扩展 Query，然后这些 Query **并行查询 Milvus 向量数据库**，最后做融合、去重、重排序，再交给大模型生成答案。
+
+------
+
+# 一、整体方案
+
+推荐采用：
+
+> **Query 多变形生成 → 多 Query 并行向量检索 Milvus → 每个 Query 内部 dense/sparse 混合检索 → 多路结果 RRF 融合 → doc/chunk 去重 → reranker 精排 → 返回 TopK 上下文**
+
+Milvus 本身支持在一个 collection 中对多个向量字段做 hybrid search，例如 dense vector 和 sparse vector，并使用 RRF 或 Weighted Ranker 进行融合；官方文档也说明 hybrid search 可以同时对多个向量字段发起 ANN 检索，并在结果端做重排融合。([Milvus](https://milvus.io/docs/multi-vector-search.md))
+但是你这里的核心是 **多个 Query 变形并行检索**，所以建议在 Java 应用层使用 `CompletableFuture` 或线程池控制并发，然后每个 Query 内部再调用 Milvus 的 hybrid search。
+
+------
+
+# 二、检索流程设计
+
+假设用户输入：
+
+```text
+孙策连招怎么打？
+```
+
+Query 理解模块可以生成：
+
+```text
+原始 Query：孙策连招怎么打？
+改写 Query：王者荣耀中孙策的技能连招和实战打法是什么？
+扩展 Query 1：孙策 一技能 二技能 大招 控制 开团 连招
+扩展 Query 2：孙策出装打法、开船切后排技巧、团战入场方式
+```
+
+然后检索层做并行查询：
+
+```text
+任务1：原始 Query → Milvus hybrid search
+任务2：改写 Query → Milvus hybrid search
+任务3：扩展 Query 1 → Milvus hybrid search
+任务4：扩展 Query 2 → Milvus hybrid search
+```
+
+每个任务返回 TopK，例如每路返回 20 条。
+
+最后融合：
+
+```text
+所有结果合并
+→ 按 chunk_id 或 doc_id + chunk_id 去重
+→ RRF 融合分数
+→ 可选调用 bge-reranker 精排
+→ 返回最终 Top 5 / Top 8 给 LLM
+```
+
+------
+
+# 三、Milvus Collection 设计
+
+你之前的游戏知识库字段可以保持这样：
+
+```text
+id                      主键
+title                   英雄名 / 文档标题
+chunk_id                分块编号
+content                 分块内容
+content_dense_vector    BGE-M3 dense 向量
+content_sparse_vector   BGE-M3 sparse 向量
+doc_id                  文档 ID
+```
+
+推荐检索时返回字段：
+
+```java
+List.of("id", "title", "chunk_id", "content", "doc_id")
+```
+
+向量字段：
+
+```java
+content_dense_vector
+content_sparse_vector
+```
+
+如果你暂时只想保留 dense/sparse 两种向量检索，不做关键词检索，那么完全可以只基于这两个字段。Milvus 的 hybrid search 本来就适合 dense + sparse 的组合，dense 负责语义召回，sparse 负责关键词匹配。([Milvus](https://milvus.io/docs/multi-vector-search.md))
+
+------
+
+# 四、推荐项目结构
+
+可以把检索部分拆成下面这些文件：
+
+```text
+src/main/java/com/example/gamerag/retrieval
+├── model
+│   ├── QueryVariant.java
+│   ├── RetrievalHit.java
+│   └── RetrievalResult.java
+│
+├── service
+│   ├── QueryVariantService.java
+│   ├── EmbeddingService.java
+│   ├── MilvusHybridSearchService.java
+│   ├── ParallelRetrievalService.java
+│   ├── RrfFusionService.java
+│   └── RerankService.java
+│
+└── config
+    ├── MilvusConfig.java
+    └── RetrievalThreadPoolConfig.java
+```
+
+核心职责如下：
+
+| 类名                        | 作用                                   |
+| --------------------------- | -------------------------------------- |
+| `QueryVariantService`       | 生成原始 Query、改写 Query、扩展 Query |
+| `EmbeddingService`          | 调用 BGE-M3 生成 dense/sparse 向量     |
+| `MilvusHybridSearchService` | 对单个 Query 查询 Milvus               |
+| `ParallelRetrievalService`  | 对多个 Query 变形并行检索              |
+| `RrfFusionService`          | 多路结果融合去重                       |
+| `RerankService`             | 调用 bge-reranker 精排                 |
+| `RetrievalHit`              | 表示一条召回结果                       |
+
+------
+
+# 五、核心数据模型
+
+## 1. QueryVariant.java
+
+```java
+package com.example.gamerag.retrieval.model;
+
+public class QueryVariant {
+
+    private String query;
+    private String type;
+    private double weight;
+
+    public QueryVariant() {
+    }
+
+    public QueryVariant(String query, String type, double weight) {
+        this.query = query;
+        this.type = type;
+        this.weight = weight;
+    }
+
+    public String getQuery() {
+        return query;
+    }
+
+    public String getType() {
+        return type;
+    }
+
+    public double getWeight() {
+        return weight;
+    }
+}
+```
+
+其中：
+
+```text
+original：权重 1.0
+rewrite：权重 0.9
+expand：权重 0.7
+```
+
+原因是原始 Query 最贴近用户意图，改写 Query 通常更完整，扩展 Query 召回面更广但可能引入噪声。
+
+------
+
+## 2. RetrievalHit.java
+
+```java
+package com.example.gamerag.retrieval.model;
+
+public class RetrievalHit {
+
+    private String id;
+    private String title;
+    private String chunkId;
+    private String docId;
+    private String content;
+
+    private double score;
+    private int rank;
+    private String sourceQuery;
+    private String queryType;
+
+    public String uniqueKey() {
+        return docId + "_" + chunkId;
+    }
+
+    public RetrievalHit() {
+    }
+
+    public RetrievalHit(String id, String title, String chunkId, String docId,
+                        String content, double score, int rank,
+                        String sourceQuery, String queryType) {
+        this.id = id;
+        this.title = title;
+        this.chunkId = chunkId;
+        this.docId = docId;
+        this.content = content;
+        this.score = score;
+        this.rank = rank;
+        this.sourceQuery = sourceQuery;
+        this.queryType = queryType;
+    }
+
+    public String getId() {
+        return id;
+    }
+
+    public String getTitle() {
+        return title;
+    }
+
+    public String getChunkId() {
+        return chunkId;
+    }
+
+    public String getDocId() {
+        return docId;
+    }
+
+    public String getContent() {
+        return content;
+    }
+
+    public double getScore() {
+        return score;
+    }
+
+    public int getRank() {
+        return rank;
+    }
+
+    public String getSourceQuery() {
+        return sourceQuery;
+    }
+
+    public String getQueryType() {
+        return queryType;
+    }
+
+    public void setScore(double score) {
+        this.score = score;
+    }
+}
+```
+
+------
+
+# 六、线程池配置
+
+不要直接使用默认的 `ForkJoinPool.commonPool()`，因为 RAG 检索属于 IO + 远程调用混合任务，应该单独配置线程池。
+
+## RetrievalThreadPoolConfig.java
+
+```java
+package com.example.gamerag.retrieval.config;
+
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+
+@Configuration
+public class RetrievalThreadPoolConfig {
+
+    @Bean("retrievalExecutor")
+    public ExecutorService retrievalExecutor() {
+        return new ThreadPoolExecutor(
+                4,
+                8,
+                60,
+                TimeUnit.SECONDS,
+                new LinkedBlockingQueue<>(100),
+                new ThreadPoolExecutor.CallerRunsPolicy()
+        );
+    }
+}
+```
+
+推荐参数：
+
+```text
+corePoolSize = 4
+maxPoolSize = 8
+queue = 100
+timeout = 60s
+```
+
+如果 Query 变形数量通常只有 3 到 5 个，这个线程池足够。
+
+------
+
+# 七、Query 变形生成
+
+## QueryVariantService.java
+
+实际项目里这里可以调用豆包大模型做改写和扩展。为了可落地，先给一个简单版本：
+
+```java
+package com.example.gamerag.retrieval.service;
+
+import com.example.gamerag.retrieval.model.QueryVariant;
+import org.springframework.stereotype.Service;
+
+import java.util.ArrayList;
+import java.util.List;
+
+@Service
+public class QueryVariantService {
+
+    public List<QueryVariant> buildVariants(String userQuery) {
+        List<QueryVariant> variants = new ArrayList<>();
+
+        // 1. 原始 Query
+        variants.add(new QueryVariant(userQuery, "original", 1.0));
+
+        // 2. 简单改写
+        String rewrite = "王者荣耀中，" + userQuery + "，请结合技能机制、连招、出装和实战场景回答。";
+        variants.add(new QueryVariant(rewrite, "rewrite", 0.9));
+
+        // 3. 扩展 Query
+        String expand = userQuery + " 技能介绍 连招 打法 出装 铭文 团战 对线 克制";
+        variants.add(new QueryVariant(expand, "expand", 0.7));
+
+        return variants;
+    }
+}
+```
+
+更好的方式是让 LLM 输出 JSON：
+
+```json
+{
+  "original": "孙策连招怎么打？",
+  "rewrite": "王者荣耀中孙策的技能连招、开团打法和实战技巧是什么？",
+  "expansions": [
+    "孙策 一技能 二技能 三技能 控制 开团 连招",
+    "孙策 出装 铭文 团战 切后排 打法"
+  ]
+}
+```
+
+但是要加一个约束：**最多保留 4 个变形 Query**。太多 Query 会造成 Milvus 压力大，并且引入噪声。
+
+------
+
+# 八、EmbeddingService 设计
+
+因为你使用的是 BGE-M3，建议一次接口返回：
+
+```text
+dense vector
+sparse vector
+```
+
+封装成：
+
+```java
+package com.example.gamerag.retrieval.service;
+
+import org.springframework.stereotype.Service;
+
+import java.util.List;
+import java.util.SortedMap;
+import java.util.TreeMap;
+
+@Service
+public class EmbeddingService {
+
+    public EmbeddingResult embed(String text) {
+        // 这里替换成你实际调用魔塔 / SiliconFlow / 本地 BGE-M3 的代码
+        List<Float> denseVector = mockDenseVector(1024);
+        SortedMap<Long, Float> sparseVector = mockSparseVector();
+
+        return new EmbeddingResult(denseVector, sparseVector);
+    }
+
+    private List<Float> mockDenseVector(int dim) {
+        return java.util.stream.IntStream.range(0, dim)
+                .mapToObj(i -> 0.01f)
+                .toList();
+    }
+
+    private SortedMap<Long, Float> mockSparseVector() {
+        SortedMap<Long, Float> sparse = new TreeMap<>();
+        sparse.put(101L, 0.8f);
+        sparse.put(203L, 0.6f);
+        return sparse;
+    }
+
+    public static class EmbeddingResult {
+        private final List<Float> denseVector;
+        private final SortedMap<Long, Float> sparseVector;
+
+        public EmbeddingResult(List<Float> denseVector, SortedMap<Long, Float> sparseVector) {
+            this.denseVector = denseVector;
+            this.sparseVector = sparseVector;
+        }
+
+        public List<Float> getDenseVector() {
+            return denseVector;
+        }
+
+        public SortedMap<Long, Float> getSparseVector() {
+            return sparseVector;
+        }
+    }
+}
+```
+
+注意：真实项目中 `mockDenseVector` 和 `mockSparseVector` 要替换为 BGE-M3 的接口调用结果。
+
+------
+
+# 九、单个 Query 的 Milvus hybrid search
+
+如果你用的是 Java SDK 2.x，可以采用 Milvus 的 hybrid search。官方 Java 文档中，`HybridSearchReq` 可以接收多个 `AnnSearchReq`，然后通过 `client.hybridSearch(hybridSearchReq)` 查询；`AnnSearchReq` 中可以指定向量字段、向量数据和 limit。([Milvus](https://milvus.io/docs/weighted-ranker.md))
+
+这里建议每个 Query 内部这样查：
+
+```text
+dense search: content_dense_vector
+sparse search: content_sparse_vector
+ranker: RRF
+topK: 20
+```
+
+Milvus 的 RRF Ranker 会根据各路检索结果的排名位置融合，而不是直接比较原始相似度分数，适合 dense/sparse 分数尺度不同的场景。([Milvus](https://milvus.io/docs/rrf-ranker.md))
+
+------
+
+## MilvusHybridSearchService.java
+
+下面代码偏工程化，部分解析 `SearchResp` 的地方需要按你当前 SDK 返回结构微调。
+
+```java
+package com.example.gamerag.retrieval.service;
+
+import com.example.gamerag.retrieval.model.QueryVariant;
+import com.example.gamerag.retrieval.model.RetrievalHit;
+import io.milvus.v2.client.MilvusClientV2;
+import io.milvus.v2.service.vector.request.AnnSearchReq;
+import io.milvus.v2.service.vector.request.HybridSearchReq;
+import io.milvus.v2.service.vector.request.data.FloatVec;
+import io.milvus.v2.service.vector.response.SearchResp;
+import org.springframework.stereotype.Service;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+
+@Service
+public class MilvusHybridSearchService {
+
+    private static final String COLLECTION_NAME = "game_knowledge";
+    private static final String DENSE_FIELD = "content_dense_vector";
+    private static final String SPARSE_FIELD = "content_sparse_vector";
+
+    private final MilvusClientV2 milvusClient;
+    private final EmbeddingService embeddingService;
+
+    public MilvusHybridSearchService(MilvusClientV2 milvusClient,
+                                     EmbeddingService embeddingService) {
+        this.milvusClient = milvusClient;
+        this.embeddingService = embeddingService;
+    }
+
+    public List<RetrievalHit> searchOneVariant(QueryVariant variant, int topK) {
+        EmbeddingService.EmbeddingResult embedding = embeddingService.embed(variant.getQuery());
+
+        List<AnnSearchReq> searchRequests = new ArrayList<>();
+
+        AnnSearchReq denseSearch = AnnSearchReq.builder()
+                .vectorFieldName(DENSE_FIELD)
+                .vectors(List.of(new FloatVec(embedding.getDenseVector())))
+                .limit(topK)
+                .build();
+
+        searchRequests.add(denseSearch);
+
+        /*
+         * 如果你当前 Milvus Java SDK 版本支持 SparseFloatVec，
+         * 这里可以加入 sparse search。
+         * 不同 SDK 版本 sparse vector 的 Java 类型可能略有差异，
+         * 如果当前项目已能插入 sparse vector，就按插入时的数据结构构造查询 sparse vector。
+         */
+        // AnnSearchReq sparseSearch = AnnSearchReq.builder()
+        //        .vectorFieldName(SPARSE_FIELD)
+        //        .vectors(List.of(new SparseFloatVec(embedding.getSparseVector())))
+        //        .limit(topK)
+        //        .build();
+        // searchRequests.add(sparseSearch);
+
+        HybridSearchReq req = HybridSearchReq.builder()
+                .collectionName(COLLECTION_NAME)
+                .searchRequests(searchRequests)
+                .limit(topK)
+                .outputFields(Arrays.asList("id", "title", "chunk_id", "content", "doc_id"))
+                .build();
+
+        SearchResp resp = milvusClient.hybridSearch(req);
+
+        return parseSearchResp(resp, variant);
+    }
+
+    private List<RetrievalHit> parseSearchResp(SearchResp resp, QueryVariant variant) {
+        List<RetrievalHit> hits = new ArrayList<>();
+
+        /*
+         * 这里需要按照你当前 milvus-sdk-java 版本的 SearchResp 结构解析。
+         * 思路如下：
+         * 1. 遍历返回结果
+         * 2. 取出 id/title/chunk_id/content/doc_id
+         * 3. 取出 distance 或 score
+         * 4. 记录 rank
+         */
+
+        int rank = 1;
+
+        // 下面是结构示意，具体 getter 以你项目 SDK 为准
+        for (List<SearchResp.SearchResult> resultList : resp.getSearchResults()) {
+            for (SearchResp.SearchResult item : resultList) {
+
+                Object idValue = item.getEntity().get("id");
+                Object titleValue = item.getEntity().get("title");
+                Object chunkIdValue = item.getEntity().get("chunk_id");
+                Object contentValue = item.getEntity().get("content");
+                Object docIdValue = item.getEntity().get("doc_id");
+
+                RetrievalHit hit = new RetrievalHit(
+                        String.valueOf(idValue),
+                        String.valueOf(titleValue),
+                        String.valueOf(chunkIdValue),
+                        String.valueOf(docIdValue),
+                        String.valueOf(contentValue),
+                        item.getScore(),
+                        rank,
+                        variant.getQuery(),
+                        variant.getType()
+                );
+
+                hits.add(hit);
+                rank++;
+            }
+        }
+
+        return hits;
+    }
+}
+```
+
+如果你使用的是旧版 `MilvusServiceClient + HybridSearchParam + AnnSearchParam`，官方文档里 `HybridSearchParam.Builder` 支持 `addSearchRequest(AnnSearchParam)`，`AnnSearchParam` 支持指定向量字段、TopK、float vectors、sparse float vectors 等；同时 `HybridSearchParam` 可以设置 `RRFRanker` 或 `WeightedRanker`。([Milvus](https://milvus.io/api-reference/java/v2.6.x/v1/QuerySearch/hybridSearch.md))
+
+------
+
+# 十、多个 Query 并行检索
+
+## ParallelRetrievalService.java
+
+这是整个检索部分的核心。
+
+```java
+package com.example.gamerag.retrieval.service;
+
+import com.example.gamerag.retrieval.model.QueryVariant;
+import com.example.gamerag.retrieval.model.RetrievalHit;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.stereotype.Service;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.TimeUnit;
+
+@Service
+public class ParallelRetrievalService {
+
+    private final QueryVariantService queryVariantService;
+    private final MilvusHybridSearchService milvusHybridSearchService;
+    private final RrfFusionService rrfFusionService;
+    private final ExecutorService retrievalExecutor;
+
+    public ParallelRetrievalService(QueryVariantService queryVariantService,
+                                    MilvusHybridSearchService milvusHybridSearchService,
+                                    RrfFusionService rrfFusionService,
+                                    @Qualifier("retrievalExecutor") ExecutorService retrievalExecutor) {
+        this.queryVariantService = queryVariantService;
+        this.milvusHybridSearchService = milvusHybridSearchService;
+        this.rrfFusionService = rrfFusionService;
+        this.retrievalExecutor = retrievalExecutor;
+    }
+
+    public List<RetrievalHit> retrieve(String userQuery) {
+        List<QueryVariant> variants = queryVariantService.buildVariants(userQuery);
+
+        int perQueryTopK = 20;
+        int finalTopK = 8;
+
+        List<CompletableFuture<List<RetrievalHit>>> futures = variants.stream()
+                .map(variant -> CompletableFuture.supplyAsync(() -> {
+                    try {
+                        return milvusHybridSearchService.searchOneVariant(variant, perQueryTopK);
+                    } catch (Exception e) {
+                        // 单路失败不能影响整体检索
+                        System.err.println("Milvus search failed, query=" + variant.getQuery()
+                                + ", error=" + e.getMessage());
+                        return List.<RetrievalHit>of();
+                    }
+                }, retrievalExecutor).orTimeout(3, TimeUnit.SECONDS))
+                .toList();
+
+        List<List<RetrievalHit>> multiResults = new ArrayList<>();
+
+        for (CompletableFuture<List<RetrievalHit>> future : futures) {
+            try {
+                multiResults.add(future.get());
+            } catch (Exception e) {
+                // 超时或异常，跳过该路
+                multiResults.add(List.of());
+            }
+        }
+
+        return rrfFusionService.fuse(multiResults, finalTopK);
+    }
+}
+```
+
+这里有几个关键点：
+
+```text
+1. 每个 Query 变形是一个异步任务。
+2. 每个任务独立调用 Milvus。
+3. 单路失败不影响整体结果。
+4. 每个任务设置超时时间，例如 3 秒。
+5. 最后统一进入 RRF 融合。
+```
+
+------
+
+# 十一、多路结果 RRF 融合去重
+
+RRF 的公式可以写成：
+
+```text
+score(d) = Σ weight_i / (k + rank_i(d))
+```
+
+其中：
+
+```text
+d：某个 chunk
+i：第 i 路检索结果
+rank_i(d)：该 chunk 在第 i 路结果中的排名
+k：平滑系数，常用 60
+weight_i：该 Query 变形的权重
+```
+
+Milvus 官方 RRF 文档中也说明，RRF 是根据不同检索路径中的排名位置进行融合，常见平滑参数 k 默认是 60，也可以根据业务调整。([Milvus](https://milvus.io/docs/rrf-ranker.md))
+
+------
+
+## RrfFusionService.java
+
+```java
+package com.example.gamerag.retrieval.service;
+
+import com.example.gamerag.retrieval.model.RetrievalHit;
+import org.springframework.stereotype.Service;
+
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+@Service
+public class RrfFusionService {
+
+    private static final double RRF_K = 60.0;
+
+    public List<RetrievalHit> fuse(List<List<RetrievalHit>> multiResults, int finalTopK) {
+        Map<String, RetrievalHit> bestHitMap = new HashMap<>();
+        Map<String, Double> scoreMap = new HashMap<>();
+
+        for (List<RetrievalHit> resultList : multiResults) {
+            for (int i = 0; i < resultList.size(); i++) {
+                RetrievalHit hit = resultList.get(i);
+
+                String key = hit.uniqueKey();
+                int rank = i + 1;
+
+                double queryWeight = queryTypeWeight(hit.getQueryType());
+                double rrfScore = queryWeight / (RRF_K + rank);
+
+                scoreMap.merge(key, rrfScore, Double::sum);
+
+                bestHitMap.compute(key, (k, oldHit) -> {
+                    if (oldHit == null) {
+                        return hit;
+                    }
+                    // 保留原始 Milvus score 更高的那条元信息
+                    return hit.getScore() > oldHit.getScore() ? hit : oldHit;
+                });
+            }
+        }
+
+        return scoreMap.entrySet()
+                .stream()
+                .sorted(Map.Entry.<String, Double>comparingByValue().reversed())
+                .limit(finalTopK)
+                .map(entry -> {
+                    RetrievalHit hit = bestHitMap.get(entry.getKey());
+                    hit.setScore(entry.getValue());
+                    return hit;
+                })
+                .toList();
+    }
+
+    private double queryTypeWeight(String queryType) {
+        if ("original".equals(queryType)) {
+            return 1.0;
+        }
+        if ("rewrite".equals(queryType)) {
+            return 0.9;
+        }
+        if ("expand".equals(queryType)) {
+            return 0.7;
+        }
+        return 0.8;
+    }
+}
+```
+
+------
+
+# 十二、为什么不直接把多个 Query 丢给 Milvus 一次查？
+
+不建议一开始这么做。
+
+原因是：
+
+1. 多个 Query 变形代表的是多种检索意图，应该保留每一路的排名信息。
+2. RRF 需要知道某个 chunk 在每一路 Query 中的排名。
+3. 如果直接把多个 Query 的向量作为 batch 一次查，结果解析和融合会更复杂。
+4. 应用层并行更容易做超时控制、降级、日志分析和权重调整。
+
+所以推荐：
+
+```text
+应用层并行多个 Query
+每个 Query 内部使用 Milvus dense/sparse hybrid search
+应用层再做 Query 级别 RRF 融合
+```
+
+也就是两层融合：
+
+```text
+第一层：Milvus 内部融合 dense / sparse
+第二层：Java 应用层融合 original / rewrite / expand
+```
+
+------
+
+# 十三、接口示例
+
+## RetrievalController.java
+
+```java
+package com.example.gamerag.controller;
+
+import com.example.gamerag.retrieval.model.RetrievalHit;
+import com.example.gamerag.retrieval.service.ParallelRetrievalService;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+
+import java.util.List;
+
+@RestController
+public class RetrievalController {
+
+    private final ParallelRetrievalService parallelRetrievalService;
+
+    public RetrievalController(ParallelRetrievalService parallelRetrievalService) {
+        this.parallelRetrievalService = parallelRetrievalService;
+    }
+
+    @GetMapping("/rag/retrieve")
+    public List<RetrievalHit> retrieve(@RequestParam String query) {
+        return parallelRetrievalService.retrieve(query);
+    }
+}
+```
+
+测试：
+
+```bash
+GET http://localhost:8080/rag/retrieve?query=孙策连招怎么打
+```
+
+预期返回：
+
+```json
+[
+  {
+    "title": "孙策",
+    "chunkId": "3",
+    "docId": "hero_sunce",
+    "content": "孙策常用连招为三技能开船接近敌人...",
+    "score": 0.0471,
+    "sourceQuery": "王者荣耀中孙策的技能连招和实战打法是什么？",
+    "queryType": "rewrite"
+  }
+]
+```
+
+------
+
+# 十四、可落地参数建议
+
+## 1. Query 变形数量
+
+```text
+最少：2 个，原始 Query + 改写 Query
+推荐：3 到 4 个
+最多：5 个
+```
+
+不要扩展太多，否则会召回很多不相关内容。
+
+------
+
+## 2. 每路召回数量
+
+```text
+perQueryTopK = 20
+```
+
+如果 Query 变形有 4 个，那么最多召回：
+
+```text
+4 × 20 = 80 条
+```
+
+融合去重后通常剩下 30 到 50 条。
+
+------
+
+## 3. 最终给 reranker 的数量
+
+```text
+rerankInputTopN = 30
+```
+
+------
+
+## 4. 最终给 LLM 的数量
+
+```text
+finalTopK = 5 到 8
+```
+
+游戏问答一般 chunk 不宜太多，否则 prompt 太长，模型容易混乱。
+
+------
+
+# 十五、推荐完整检索链路
+
+最终你的 RAG 检索部分可以写成：
+
+```text
+用户 Query
+  ↓
+QueryVariantService
+生成 original / rewrite / expand
+  ↓
+ParallelRetrievalService
+并行提交多个检索任务
+  ↓
+MilvusHybridSearchService
+每个 Query 内部查 content_dense_vector + content_sparse_vector
+  ↓
+RrfFusionService
+跨 Query 结果融合、去重
+  ↓
+RerankService
+bge-reranker 精排
+  ↓
+PromptBuilder
+组装游戏知识上下文
+  ↓
+豆包 LLM 生成答案
+```
+
+更具体一点：
+
+```text
+孙策连招怎么打？
+  ↓
+[
+  孙策连招怎么打？,
+  王者荣耀中孙策的技能连招和实战打法是什么？,
+  孙策 技能 连招 开团 出装 团战,
+  孙策 一技能 二技能 三技能 控制 切后排
+]
+  ↓ 并行 Milvus 检索
+[
+  result_from_original,
+  result_from_rewrite,
+  result_from_expand_1,
+  result_from_expand_2
+]
+  ↓
+RRF 融合 + chunk 去重
+  ↓
+bge-reranker 精排
+  ↓
+Top 5 chunks
+  ↓
+LLM 生成
+```
+
+------
+
+# 十六、关键落地点总结
+
+你的系统可以这样实现：
+
+```text
+1. Query 理解模块生成多个 QueryVariant。
+2. 每个 QueryVariant 使用 CompletableFuture 并行检索 Milvus。
+3. 每个 QueryVariant 内部使用 dense + sparse hybrid search。
+4. 每路结果保留 rank、score、queryType、sourceQuery。
+5. 使用 doc_id + chunk_id 去重。
+6. 使用 RRF 融合多路结果。
+7. 使用 bge-reranker 精排融合后的候选 chunk。
+8. 取 TopK 组装 Prompt。
+```
+
+最重要的代码就是这三个：
+
+```text
+QueryVariantService          负责生成多个 Query
+ParallelRetrievalService     负责并行查询 Milvus
+RrfFusionService             负责融合去重
+```
+
+这个方案的优点是：实现简单、并发可控、容易调参、容易排查哪一路 Query 带来了好结果，也方便后续增加缓存、过滤、重排序和日志评估。
+
+
+
+
+
+下面按 **RAG 系统中的作用、模型对比、本地部署、vLLM/TEI/Infinity/Ollama 等部署方式、实际选型方案** 来整理。
+
+------
+
+# 1. 先给结论：Embedding 和 Reranker 在 RAG 中分工不同
+
+在 RAG 系统里，**嵌入模型负责“召回”**，也就是从大量文档中快速找出可能相关的 Top-K；**重排序模型负责“精排”**，也就是在 Top-K 候选文档里判断哪些片段真正和问题最相关。常见生产流程是：
+
+```text
+用户 Query
+   ↓
+Query 改写 / 扩展 / 意图识别
+   ↓
+Embedding 向量化
+   ↓
+Milvus / Qdrant / FAISS / Elasticsearch 向量检索
+   ↓
+召回 Top 50 / Top 100 / Top 200
+   ↓
+Reranker 对 query-document pair 打分
+   ↓
+精选 Top 5 / Top 10
+   ↓
+拼接 Prompt
+   ↓
+LLM 生成答案
+```
+
+一句话概括：
+
+| 模块           | 核心作用       | 解决的问题                 |
+| -------------- | -------------- | -------------------------- |
+| Embedding 模型 | 大规模快速召回 | “相关文档能不能被找出来”   |
+| Reranker 模型  | 小规模精确排序 | “最相关文档能不能排在前面” |
+
+Sentence Transformers 官方也把这种范式称为 **Retrieve & Re-Rank**：先用 SentenceTransformer 计算语义向量做检索，再用重排序模型提升复杂问答场景下的检索质量。([sbert.net](https://www.sbert.net/examples/sentence_transformer/applications/retrieve_rerank/README.html))
+
+------
+
+# 2. Embedding 模型与 Reranker 模型的本质区别
+
+## 2.1 Embedding 模型：双塔 / Bi-Encoder
+
+Embedding 模型通常是 **双塔结构**：
+
+```text
+Query  → Encoder → query vector
+Doc    → Encoder → doc vector
+
+相似度 = cosine / dot product
+```
+
+特点是：
+
+| 维度     | Embedding 模型                                          |
+| -------- | ------------------------------------------------------- |
+| 输入     | 单独输入 Query 或 Document                              |
+| 输出     | 一个向量，例如 384 / 768 / 1024 / 4096 维               |
+| 检索方式 | 向量数据库 ANN 近似最近邻搜索                           |
+| 优点     | 快、可预先建索引、适合百万级/千万级文档                 |
+| 缺点     | Query 和 Doc 是分别编码，细粒度交互弱                   |
+| 主要指标 | Recall@K、MRR、NDCG、Hit Rate                           |
+| 典型模型 | bge-m3、Qwen3-Embedding、E5、GTE、Nomic、EmbeddingGemma |
+
+Embedding 的核心价值是：**大规模候选召回**。它必须快，因为它要面对整个知识库。
+
+------
+
+## 2.2 Reranker 模型：交叉编码 / Cross-Encoder
+
+Reranker 通常是 **交叉编码结构**：
+
+```text
+[Query, Document] → Cross Encoder → relevance score
+```
+
+也就是说，Reranker 会把问题和文档片段一起输入模型，让模型直接判断二者相关性。
+
+| 维度     | Reranker 模型                                                |
+| -------- | ------------------------------------------------------------ |
+| 输入     | Query + Document pair                                        |
+| 输出     | 一个相关性分数                                               |
+| 检索方式 | 对已召回候选逐条打分                                         |
+| 优点     | 判断更准，能理解细节匹配、否定、条件、实体关系               |
+| 缺点     | 慢，不能直接对全库打分                                       |
+| 主要指标 | NDCG@K、MRR@K、Precision@K                                   |
+| 典型模型 | bge-reranker-v2-m3、Qwen3-Reranker、Jina Reranker、Cohere Rerank |
+
+BGE 官方模型卡也明确说明：reranker 和 embedding 不同，它接收 **question + document** 作为输入，然后直接输出相关性分数。([Hugging Face](https://huggingface.co/BAAI/bge-reranker-v2-m3))
+
+------
+
+# 3. 在 RAG 中，Embedding 和 Reranker 怎么配合？
+
+## 3.1 只用 Embedding 的问题
+
+只用 Embedding 做 RAG 时，常见问题有：
+
+1. **召回结果语义相似但不真正回答问题**
+   例如问“孙权的一技能冷却时间是多少”，Embedding 可能召回“孙权技能介绍”“孙权出装推荐”“孙权背景故事”。
+2. **长文本中局部相关性被稀释**
+   文档 chunk 太长时，向量表示会混合多个主题。
+3. **容易被表面语义误导**
+   例如 Query 中出现“暴击”“伤害”“控制”，模型可能召回很多泛化技能描述。
+4. **Top-K 顺序不够稳定**
+   真正有答案的 chunk 可能在 Top 20 以后，LLM 拼上下文时被截掉。
+
+------
+
+## 3.2 加 Reranker 后的改进
+
+Reranker 可以对每个候选片段做更细判断：
+
+```text
+Query: 孙权被动技能有什么效果？
+
+候选1: 孙权技能介绍-被动：坐断东南……
+候选2: 孙权推荐出装……
+候选3: 孙权铭文推荐……
+候选4: 孙权历史背景……
+```
+
+Embedding 可能把这几个都召回，但 Reranker 会把候选1排到最前面。
+
+所以常见设置是：
+
+| 阶段           | 推荐数量                   |
+| -------------- | -------------------------- |
+| Embedding 召回 | Top 50 / 100 / 200         |
+| Reranker 精排  | 从候选中选 Top 5 / 10 / 20 |
+| LLM 上下文     | 通常放 Top 3-10 个 chunk   |
+
+实践中不要只召回 Top 5 再 rerank，因为如果答案没被召回，Reranker 没法“凭空找回”。
+
+------
+
+# 4. Embedding 模型类型对比
+
+## 4.1 Dense Embedding：稠密向量
+
+这是最常用的 Embedding。
+
+代表模型：
+
+- BAAI/bge-m3
+- Qwen/Qwen3-Embedding
+- intfloat/multilingual-e5-large-instruct
+- Alibaba-NLP/gte-Qwen2-7B-instruct
+- nomic-ai/nomic-embed-text-v1.5
+- sentence-transformers/all-MiniLM-L6-v2
+
+优点：
+
+- 通用性强。
+- 适合语义检索。
+- 和 Milvus、Qdrant、FAISS、pgvector 配合成熟。
+
+缺点：
+
+- 对精确词匹配、专有名词、编号、代码符号不一定稳定。
+- 对表格、公式、长文档细节可能不如混合检索。
+
+------
+
+## 4.2 Sparse Embedding：稀疏向量
+
+Sparse embedding 更接近关键词检索，但权重由模型学习得到。
+
+优点：
+
+- 对关键词、专有名词、实体名、术语更敏感。
+- 可弥补 Dense Embedding 的“语义过度泛化”问题。
+
+缺点：
+
+- 存储和检索系统支持要求更高。
+- 实现复杂度比纯 dense 高。
+
+------
+
+## 4.3 Multi-Vector Embedding：多向量表示
+
+Multi-vector 模型不是把整个文档压成一个向量，而是保留多个 token 或片段级向量。
+
+优点：
+
+- 细粒度匹配强。
+- 对长文本、复杂句子更友好。
+
+缺点：
+
+- 存储量大。
+- 检索计算更重。
+- 工程复杂度高。
+
+------
+
+## 4.4 Hybrid Embedding：混合检索模型
+
+典型代表是 **BGE-M3**。
+
+BGE-M3 的特点是：
+
+- Multi-Functionality：同时支持 dense retrieval、sparse retrieval、multi-vector retrieval。
+- Multi-Linguality：支持 100 多种语言。
+- Multi-Granularity：支持从短句到最长 8192 token 的不同粒度输入。([Hugging Face](https://huggingface.co/BAAI/bge-m3))
+
+对于中文、英文混合知识库，或者游戏知识库这种包含大量技能名、装备名、术语、数值的场景，BGE-M3 是一个很稳的本地部署选择。
+
+------
+
+# 5. 主流 Embedding 模型对比
+
+## 5.1 推荐模型总表
+
+| 模型                               | 参数规模    | 语言能力           | 上下文长度     | 适合场景                  | 本地部署         |
+| ---------------------------------- | ----------- | ------------------ | -------------- | ------------------------- | ---------------- |
+| **Qwen3-Embedding-0.6B**           | 0.6B        | 多语言，中英文强   | 32K            | 中文 RAG、代码、长文档    | 可以             |
+| **Qwen3-Embedding-4B**             | 4B          | 多语言，中英文强   | 32K            | 高质量企业知识库          | 可以，需 GPU     |
+| **Qwen3-Embedding-8B**             | 8B          | 多语言，中英文很强 | 32K            | 高精度 RAG、复杂检索      | 可以，GPU 要求高 |
+| **BAAI/bge-m3**                    | 约 568M     | 多语言             | 8192           | 通用 RAG、混合检索        | 可以             |
+| **multilingual-e5-large-instruct** | 约 560M     | 多语言             | 512/更长视实现 | 多语言语义检索            | 可以             |
+| **gte-Qwen2-7B-instruct**          | 7B          | 中英强             | 8192           | 高质量中文/英文检索       | 可以，需 GPU     |
+| **nomic-embed-text-v1.5**          | 中小型      | 英文为主，多任务   | 8192           | 英文 RAG、Matryoshka 降维 | 可以             |
+| **snowflake-arctic-embed2**        | 305M / 113M | 多语言             | 8192           | 轻量、多语言、企业部署    | 可以             |
+| **EmbeddingGemma**                 | 308M        | 多语言             | 2K             | 端侧、本地轻量部署        | 可以             |
+| **all-MiniLM-L6-v2**               | 很小        | 英文为主           | 较短           | CPU 快速 baseline         | 可以             |
+| **jina-embeddings-v4**             | 约 3B 级    | 多语言、多模态     | 长文档         | PDF、图文、表格、复杂文档 | 可以，但较重     |
+
+------
+
+## 5.2 Qwen3-Embedding 系列
+
+Qwen3-Embedding 是目前非常值得关注的开源嵌入模型系列，包含：
+
+| 模型                 | 参数 | 输出维度 | 上下文 | 特点             |
+| -------------------- | ---- | -------- | ------ | ---------------- |
+| Qwen3-Embedding-0.6B | 0.6B | 1024     | 32K    | 轻量，高性价比   |
+| Qwen3-Embedding-4B   | 4B   | 2560     | 32K    | 质量和成本平衡   |
+| Qwen3-Embedding-8B   | 8B   | 4096     | 32K    | 高精度，多语言强 |
+
+Qwen3-Embedding 官方说明其支持 100 多种语言，并支持灵活向量维度、指令感知和 Matryoshka Representation Learning。模型卡中给出的 MTEB 多语言榜单里，Qwen3-Embedding-8B 的平均分为 70.58，Qwen3-Embedding-4B 为 69.45，Qwen3-Embedding-0.6B 为 64.33；同表中 BGE-M3 为 59.56，multilingual-e5-large-instruct 为 63.22。([Hugging Face](https://huggingface.co/Qwen/Qwen3-Embedding-8B))
+
+**适合：**
+
+- 中文 RAG。
+- 中英混合知识库。
+- 长文档检索。
+- 代码、技术文档、问答型检索。
+- 对准确率要求较高的企业 RAG。
+
+**部署建议：**
+
+- 显存有限：Qwen3-Embedding-0.6B。
+- 单卡中等显存：Qwen3-Embedding-4B。
+- 高精度优先：Qwen3-Embedding-8B。
+
+Qwen3-Embedding 官方模型卡也给出了 vLLM 和 TEI 部署方式，其中 vLLM 需要较新的版本，例如示例中要求 `vllm>=0.8.5`。([Hugging Face](https://huggingface.co/Qwen/Qwen3-Embedding-8B))
+
+------
+
+## 5.3 BAAI/bge-m3
+
+BGE-M3 是目前本地 RAG 中非常常用的通用模型，优势是：
+
+1. 支持 dense embedding。
+2. 支持 sparse embedding。
+3. 支持 multi-vector。
+4. 支持多语言。
+5. 支持最长 8192 token。
+6. 可用 FlagEmbedding 很方便地部署。([Hugging Face](https://huggingface.co/BAAI/bge-m3))
+
+**适合：**
+
+- 中文知识库。
+- 中英混合知识库。
+- 游戏知识库。
+- 技术文档。
+- 有大量专有名词、技能名、装备名、规则条目的场景。
+- 需要 dense + sparse 混合检索的场景。
+
+对于你的游戏 RAG 系统，如果 Milvus collection 里已经设计了：
+
+```text
+content_dense_vector
+content_sparse_vector
+```
+
+那么 BGE-M3 非常合适，因为它本身就能同时产出 dense 和 sparse 相关表示。
+
+------
+
+## 5.4 multilingual-e5-large-instruct
+
+E5 系列是经典通用 Embedding 模型。`multilingual-e5-large-instruct` 模型卡说明其为 24 层、1024 维嵌入模型。([Hugging Face](https://huggingface.co/intfloat/multilingual-e5-large-instruct))
+
+**优点：**
+
+- 多语言稳定。
+- SentenceTransformers / Transformers 支持成熟。
+- 适合作为企业 RAG baseline。
+
+**缺点：**
+
+- 相比 Qwen3-Embedding 和 BGE-M3，中文复杂任务和长上下文能力不一定最优。
+- 通常需要正确加 instruction / prefix，效果才稳定。
+
+------
+
+## 5.5 gte-Qwen2-7B-instruct
+
+GTE-Qwen2-7B-instruct 是阿里基于 Qwen2-7B 构建的嵌入模型。模型卡中说明它使用双向注意力、query-side instruction tuning 和多语言语料训练，并支持 8192 长度输入。([Hugging Face](https://huggingface.co/Alibaba-NLP/gte-Qwen2-7B-instruct))
+
+**优点：**
+
+- 中英文检索能力强。
+- 适合高质量 RAG。
+- 对技术文档、长文档较友好。
+
+**缺点：**
+
+- 7B 级别模型，部署成本高。
+- 如果只是普通知识库检索，性价比可能不如 Qwen3-Embedding-0.6B / 4B 或 bge-m3。
+
+------
+
+## 5.6 Nomic Embed v1.5
+
+Nomic Embed v1.5 支持 8192 上下文长度，并支持 Matryoshka 降维，例如 768、512、256、128、64 维。模型卡也强调使用时需要加任务前缀，例如文档用 `search_document:`，查询用 `search_query:`。([Hugging Face](https://huggingface.co/nomic-ai/nomic-embed-text-v1.5))
+
+**适合：**
+
+- 英文知识库。
+- 想降低向量维度、减少存储成本的场景。
+- 本地轻量部署。
+
+------
+
+## 5.7 Snowflake Arctic Embed v2
+
+Snowflake Arctic Embed v2 是 2024 年发布的多语言嵌入模型，官方模型卡说明其支持多语言工作负载、8192 上下文、Matryoshka Representation Learning 和 4-bit 量化。([Hugging Face](https://huggingface.co/Snowflake/snowflake-arctic-embed-m-v2.0))
+
+**适合：**
+
+- 资源有限但希望多语言效果不错。
+- 需要 Apache 2.0 友好协议的企业场景。
+- Ollama 本地快速部署。
+
+------
+
+## 5.8 EmbeddingGemma
+
+EmbeddingGemma 是 Google 发布的 308M 多语言文本嵌入模型，面向手机、笔记本、平板等端侧设备优化，支持检索、相似度、分类、聚类等任务，支持 100 多种语言，支持 768 到 128 维的 Matryoshka 表示，量化后内存占用可低于 200MB。([Google AI for Developers](https://ai.google.dev/gemma/docs/embeddinggemma))
+
+**适合：**
+
+- 本地轻量部署。
+- 端侧 RAG。
+- CPU / 小显存设备。
+- 对极致准确率要求不高，但要求部署方便。
+
+------
+
+## 5.9 all-MiniLM-L6-v2
+
+`all-MiniLM-L6-v2` 是 SentenceTransformers 中很经典的小模型，它把句子或段落映射为 384 维向量，常用于聚类和语义搜索。([Hugging Face](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2))
+
+**适合：**
+
+- CPU baseline。
+- 英文简单检索。
+- Demo、教学、快速验证。
+
+**不太适合：**
+
+- 高质量中文 RAG。
+- 长文档。
+- 复杂问答。
+- 领域知识库精确检索。
+
+------
+
+# 6. 主流 Reranker 模型对比
+
+## 6.1 推荐模型总表
+
+| 模型                                   | 参数规模 | 语言能力    | 上下文   | 适合场景                | 本地部署           |
+| -------------------------------------- | -------- | ----------- | -------- | ----------------------- | ------------------ |
+| **BAAI/bge-reranker-v2-m3**            | 约 568M  | 多语言      | 较长     | 通用 RAG 默认选择       | 可以               |
+| **BAAI/bge-reranker-base**             | 较小     | 中英        | 较短     | 轻量精排                | 可以               |
+| **BAAI/bge-reranker-large**            | 中等     | 中英        | 较短     | 更高质量精排            | 可以               |
+| **Qwen3-Reranker-0.6B**                | 0.6B     | 多语言      | 32K      | 轻量高质量 rerank       | 可以               |
+| **Qwen3-Reranker-4B**                  | 4B       | 多语言      | 32K      | 高质量企业 RAG          | 可以，需 GPU       |
+| **Qwen3-Reranker-8B**                  | 8B       | 多语言      | 32K      | 高精度复杂检索          | 可以，GPU 要求高   |
+| **jina-reranker-v2-base-multilingual** | base 级  | 多语言      | 较长     | 多语言、代码、TextSQL   | 可以               |
+| **bge-reranker-v2-gemma**              | 2.51B    | 多语言      | 较长     | 高质量精排              | 可以，较重         |
+| **bge-reranker-v2-minicpm-layerwise**  | 2.72B    | 多语言      | 较长     | 可调层数，速度/效果折中 | 可以               |
+| **Cohere Rerank**                      | API      | 多语言/英文 | API 限制 | 云服务精排              | 不属于本地开源部署 |
+
+------
+
+## 6.2 BAAI/bge-reranker-v2-m3
+
+这是目前本地 RAG 中非常常用的 reranker。
+
+BGE 官方文档中列出的 BGE Reranker v2 系列包括：
+
+| 模型                                 | 说明                               |
+| ------------------------------------ | ---------------------------------- |
+| bge-reranker-v2-m3                   | 基于 bge-m3，多语言，轻量，速度快  |
+| bge-reranker-v2-gemma                | 基于 gemma-2B，更高性能            |
+| bge-reranker-v2-minicpm-layerwise    | 支持选择不同层输出，速度和效果可调 |
+| bge-reranker-v2.5-gemma2-lightweight | 更大规模，质量更高                 |
+
+官方文档明确说明 `bge-reranker-v2-m3` 是 multilingual、lightweight、fast 的 reranker。([BGE Model](https://bge-model.com/tutorial/5_Reranking/5.2.html))
+
+**推荐理由：**
+
+- 中文效果好。
+- 多语言可用。
+- 本地部署成熟。
+- 和 BGE-M3 搭配自然。
+- 速度、显存、效果比较均衡。
+
+对于你的 Java + Milvus 游戏 RAG 系统，推荐组合之一就是：
+
+```text
+Embedding: BAAI/bge-m3
+Reranker: BAAI/bge-reranker-v2-m3
+```
+
+------
+
+## 6.3 Qwen3-Reranker 系列
+
+Qwen3-Reranker 包含：
+
+| 模型                | 参数 | 上下文 | 特点   |
+| ------------------- | ---- | ------ | ------ |
+| Qwen3-Reranker-0.6B | 0.6B | 32K    | 轻量   |
+| Qwen3-Reranker-4B   | 4B   | 32K    | 平衡   |
+| Qwen3-Reranker-8B   | 8B   | 32K    | 高精度 |
+
+Qwen3-Reranker 模型卡说明其支持 100 多种语言，并且是面向 text ranking 任务的模型系列。([Hugging Face](https://huggingface.co/Qwen/Qwen3-Reranker-8B))
+
+**适合：**
+
+- 中文复杂问答。
+- 长文档 rerank。
+- 技术文档。
+- 多语言 RAG。
+- 对 rerank 准确率要求高的场景。
+
+**部署建议：**
+
+- 显存有限：Qwen3-Reranker-0.6B。
+- 高质量：Qwen3-Reranker-4B。
+- 极致效果：Qwen3-Reranker-8B。
+
+如果你的业务是游戏知识库、规则问答、技能数值问答，`Qwen3-Reranker-0.6B` 或 `bge-reranker-v2-m3` 已经足够作为第一版。
+
+------
+
+## 6.4 Jina Reranker v2
+
+`jina-reranker-v2-base-multilingual` 是一个多语言 cross-encoder reranker。模型卡说明它输入 query-document pair，输出相关性分数，并且在文本检索、多语言、函数调用感知 reranking、Text-to-SQL reranking、代码检索等场景上有竞争力。([Hugging Face](https://huggingface.co/jinaai/jina-reranker-v2-base-multilingual))
+
+**适合：**
+
+- 多语言知识库。
+- 代码检索。
+- SQL / API / 函数调用相关 RAG。
+- 复杂企业文档。
+
+------
+
+# 7. 主要模型的本地部署能力对比
+
+## 7.1 Embedding 模型本地部署表
+
+| 模型                   | Transformers / SentenceTransformers | FlagEmbedding | vLLM                                     | TEI                  | Ollama                       | Infinity / Xinference | 备注                          |
+| ---------------------- | ----------------------------------- | ------------- | ---------------------------------------- | -------------------- | ---------------------------- | --------------------- | ----------------------------- |
+| Qwen3-Embedding        | 支持                                | 部分场景可用  | 支持 embedding/pooling                   | 支持                 | Ollama 有相关 embedding 模型 | 可尝试                | 适合中文高质量 RAG            |
+| BGE-M3                 | 支持                                | **强推荐**    | 可通过 pooling/Transformers backend 尝试 | 可尝试               | 部分 Ollama 社区模型         | 支持度较好            | dense + sparse + multi-vector |
+| multilingual-e5        | 支持                                | 不常用        | 支持 pooling                             | 支持                 | 部分模型可用                 | 支持                  | 经典 baseline                 |
+| GTE-Qwen2              | 支持                                | 不常用        | 可尝试                                   | TEI 支持 GTE/Qwen 系 | 可尝试                       | 支持                  | 质量强但较重                  |
+| Nomic Embed            | 支持                                | 不常用        | 可尝试                                   | 支持                 | 支持                         | 支持                  | 英文与轻量部署好              |
+| Snowflake Arctic Embed | 支持                                | 不常用        | 可尝试                                   | 可尝试               | **支持**                     | 可尝试                | Apache 2.0，轻量              |
+| EmbeddingGemma         | 支持                                | 不常用        | 可尝试                                   | Gemma 系支持         | **支持**                     | 可尝试                | 端侧友好                      |
+| all-MiniLM             | 支持                                | 不需要        | 支持 pooling                             | 支持                 | 支持                         | 支持                  | CPU baseline                  |
+| Jina Embeddings v4     | 支持                                | 不常用        | 可尝试                                   | 可尝试               | 部分 GGUF/社区               | 可尝试                | 图文复杂文档                  |
+
+vLLM 当前文档说明，它不仅支持生成式模型，也支持 pooling models，并提供 embedding、score、rerank 等接口；不过文档也提醒，vLLM 的 pooling 模型支持主要是为了部署便利，不一定总比 Transformers 或 SentenceTransformers 更快，需要实际测试。([vLLM](https://docs.vllm.ai/en/stable/models/pooling_models.html))
+
+------
+
+## 7.2 Reranker 模型本地部署表
+
+| 模型                    | SentenceTransformers CrossEncoder | FlagEmbedding | vLLM score/rerank        | TEI                 | Infinity   | Xinference | 备注              |
+| ----------------------- | --------------------------------- | ------------- | ------------------------ | ------------------- | ---------- | ---------- | ----------------- |
+| bge-reranker-v2-m3      | 支持                              | **强推荐**    | 可尝试/支持 score 类接口 | TEI rerank 支持有限 | 支持度较好 | 支持       | 本地 RAG 默认推荐 |
+| bge-reranker-base/large | 支持                              | 支持          | 可尝试                   | 有限制              | 支持       | 支持       | 中英轻量          |
+| Qwen3-Reranker          | 支持                              | 可尝试        | 需新版本和测试           | 不一定完整          | 可尝试     | 可尝试     | 长上下文强        |
+| Jina Reranker v2        | 支持                              | 不常用        | 可尝试                   | 不确定              | 可尝试     | 可尝试     | 多语言、代码检索  |
+| Cohere Rerank           | API                               | 不支持本地    | 不支持本地               | 不支持本地          | 不支持本地 | 不支持本地 | 云 API            |
+
+TEI 文档中明确支持多类 embedding 模型，包括 Nomic、GTE、Qwen2、Qwen3、Gemma3 等；但它的 sequence classification / reranking 支持范围相对有限，文档列出的 rerank 相关支持包括 CamemBERT 和 XLM-RoBERTa sequence classification models。([GitHub](https://github.com/huggingface/text-embeddings-inference))
+
+------
+
+# 8. vLLM 部署 Embedding / Reranker
+
+## 8.1 vLLM 适合什么？
+
+vLLM 以前主要用于 LLM 推理，现在也支持 pooling 类任务，包括：
+
+- `/v1/embeddings`
+- `/score`
+- `/rerank`
+- `/v1/rerank`
+- `/v2/rerank`
+- `/pooling`
+
+vLLM 文档中说明，`LLM.embed` 用于 embedding，`LLM.score` 可以用于 cross-encoder scoring，在线服务也提供 embeddings、score、rerank 等端点。([vLLM](https://docs.vllm.ai/en/stable/models/pooling_models.html))
+
+------
+
+## 8.2 vLLM 部署 Qwen3-Embedding 示例
+
+```bash
+pip install "vllm>=0.8.5"
+```
+
+启动服务：
+
+```bash
+vllm serve Qwen/Qwen3-Embedding-0.6B --runner pooling
+```
+
+调用 OpenAI-compatible embeddings 接口：
+
+```bash
+curl http://localhost:8000/v1/embeddings \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen/Qwen3-Embedding-0.6B",
+    "input": [
+      "王者荣耀中孙权的被动技能是什么？"
+    ]
+  }'
+```
+
+Python 离线调用形式可以类似：
+
+```python
+from vllm import LLM
+
+model = LLM(
+    model="Qwen/Qwen3-Embedding-0.6B",
+    task="embed"
+)
+
+outputs = model.embed([
+    "王者荣耀中孙权的被动技能是什么？"
+])
+
+vec = outputs[0].outputs.embedding
+print(len(vec))
+```
+
+Qwen3-Embedding 官方模型卡也给出了 vLLM 的 `task="embed"` 用法。([Hugging Face](https://huggingface.co/Qwen/Qwen3-Embedding-8B))
+
+------
+
+## 8.3 vLLM 部署 Reranker 示例
+
+对于 vLLM 支持的 score/rerank 类模型，可以尝试：
+
+```bash
+vllm serve BAAI/bge-reranker-v2-m3 --runner pooling
+```
+
+调用 rerank 接口：
+
+```bash
+curl http://localhost:8000/v1/rerank \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "BAAI/bge-reranker-v2-m3",
+    "query": "孙权的被动技能是什么？",
+    "documents": [
+      "孙权技能介绍-被动：坐断东南，释放技能后获得强化普攻……",
+      "孙权推荐出装：冷静之靴、暗影战斧、破军……",
+      "孙权背景故事：他是东吴势力的重要人物……"
+    ],
+    "top_n": 2
+  }'
+```
+
+需要注意：不同 vLLM 版本对具体 reranker 架构的支持程度不同。对于 BGE reranker、Qwen3-Reranker 这类模型，建议以当前 vLLM 版本实际启动测试为准。vLLM 官方文档也说明 pooling 模型需要使用 `--runner pooling`，并且部分模型会通过 Transformers backend 运行。([vLLM](https://docs.vllm.ai/en/stable/models/supported_models/))
+
+------
+
+# 9. TEI 部署 Embedding
+
+TEI，全称 Text Embeddings Inference，是 Hugging Face 提供的高性能 embedding 服务框架，适合把 embedding 模型部署成 HTTP 服务。
+
+Qwen3-Embedding 官方模型卡给出了 TEI Docker 示例。([Hugging Face](https://huggingface.co/Qwen/Qwen3-Embedding-8B))
+
+示例：
+
+```bash
+docker run --gpus all -p 8080:80 \
+  -v hf_cache:/data \
+  ghcr.io/huggingface/text-embeddings-inference:latest \
+  --model-id Qwen/Qwen3-Embedding-0.6B \
+  --dtype float16
+```
+
+调用：
+
+```bash
+curl http://localhost:8080/embed \
+  -H "Content-Type: application/json" \
+  -d '{
+    "inputs": [
+      "孙权的被动技能是什么？"
+    ]
+  }'
+```
+
+TEI 更适合部署 **Embedding 服务**。如果是 BGE reranker 或 Qwen3-Reranker，通常更推荐：
+
+- SentenceTransformers CrossEncoder
+- FlagEmbedding
+- Infinity
+- Xinference
+- vLLM score/rerank
+
+------
+
+# 10. FlagEmbedding 部署 BGE-M3 和 BGE Reranker
+
+如果你使用 BGE 系列，**FlagEmbedding 是最推荐的本地部署方式之一**。
+
+## 10.1 BGE-M3 生成 dense / sparse / multi-vector
+
+```python
+from FlagEmbedding import BGEM3FlagModel
+
+model = BGEM3FlagModel(
+    "BAAI/bge-m3",
+    use_fp16=True
+)
+
+sentences = [
+    "孙权的被动技能是什么？",
+    "技能介绍-被动：坐断东南，孙权在释放技能后获得强化效果……"
+]
+
+outputs = model.encode(
+    sentences,
+    return_dense=True,
+    return_sparse=True,
+    return_colbert_vecs=True
+)
+
+dense_vecs = outputs["dense_vecs"]
+sparse_vecs = outputs["lexical_weights"]
+colbert_vecs = outputs["colbert_vecs"]
+```
+
+BGE-M3 官方模型卡明确建议在 RAG 中使用 hybrid retrieval，并说明它同时支持 embedding 和 sparse retrieval。([Hugging Face](https://huggingface.co/BAAI/bge-m3))
+
+------
+
+## 10.2 BGE Reranker 打分
+
+```python
+from FlagEmbedding import FlagReranker
+
+reranker = FlagReranker(
+    "BAAI/bge-reranker-v2-m3",
+    use_fp16=True
+)
+
+pairs = [
+    [
+        "孙权的被动技能是什么？",
+        "技能介绍-被动：坐断东南，孙权释放技能后获得强化普攻效果……"
+    ],
+    [
+        "孙权的被动技能是什么？",
+        "孙权推荐出装为冷静之靴、暗影战斧、破军……"
+    ]
+]
+
+scores = reranker.compute_score(
+    pairs,
+    normalize=True
+)
+
+print(scores)
+```
+
+BGE 官方文档给出的 `bge-reranker-v2-m3` 使用方式也基于 FlagEmbedding，并支持 `normalize=True` 对分数做 sigmoid 归一化。([Hugging Face](https://huggingface.co/BAAI/bge-reranker-v2-m3))
+
+------
+
+# 11. Ollama 部署 Embedding
+
+Ollama 更适合快速本地运行轻量 embedding 模型，尤其是：
+
+- EmbeddingGemma
+- Snowflake Arctic Embed
+- Nomic Embed
+- Qwen3-Embedding 部分版本
+
+例如 EmbeddingGemma：
+
+```bash
+ollama pull embeddinggemma
+```
+
+调用：
+
+```bash
+curl http://localhost:11434/api/embed \
+  -d '{
+    "model": "embeddinggemma",
+    "input": "孙权的被动技能是什么？"
+  }'
+```
+
+Ollama 官方文档说明 embedding 可用于把文本转换成数值向量，并用于向量数据库和 RAG；其 `/api/embed` 端点用于生成 embedding。([docs.ollama.com](https://docs.ollama.com/capabilities/embeddings?utm_source=chatgpt.com))
+
+Snowflake Arctic Embed 也可通过 Ollama 部署：
+
+```bash
+ollama pull snowflake-arctic-embed2
+```
+
+Ollama 模型页显示 `snowflake-arctic-embed2` 支持 8K 上下文，模型大小约 1.2GB。([Ollama](https://ollama.com/library/snowflake-arctic-embed2))
+
+------
+
+# 12. Infinity / Xinference 部署
+
+## 12.1 Infinity
+
+Infinity 是一个面向 embedding、reranking 和 RAG 相关任务的推理服务框架，目标是提供高吞吐、低延迟的 REST API 服务。([GitHub](https://github.com/michaelfeil/infinity?utm_source=chatgpt.com))
+
+适合部署：
+
+- BGE embedding
+- E5
+- GTE
+- Nomic
+- BGE reranker
+- Jina reranker
+
+示意：
+
+```bash
+docker run --gpus all -p 7997:7997 michaelf34/infinity:latest \
+  v2 \
+  --model-id BAAI/bge-reranker-v2-m3 \
+  --dtype float16
+```
+
+具体命令会随 Infinity 版本变化，生产使用前建议以当前官方 README 为准。
+
+------
+
+## 12.2 Xinference
+
+Xinference 支持部署 embedding 和 rerank 模型，并且有独立的 rerank endpoint，可以对文档按语义相关性排序。([inference.readthedocs.io](https://inference.readthedocs.io/en/v1.9.0/models/model_abilities/rerank.html?utm_source=chatgpt.com))
+
+适合：
+
+- 本地模型统一管理。
+- 和 Dify / FastGPT / LangChain / LlamaIndex 集成。
+- 同时管理 LLM、Embedding、Reranker。
+
+------
+
+# 13. 针对 RAG 系统的模型组合推荐
+
+## 13.1 通用中文 / 中英 RAG 推荐
+
+```text
+Embedding: BAAI/bge-m3
+Reranker: BAAI/bge-reranker-v2-m3
+Vector DB: Milvus / Qdrant
+Deploy: FlagEmbedding / vLLM / Infinity / Xinference
+```
+
+适合：
+
+- 中文知识库。
+- 游戏知识库。
+- 企业文档。
+- 技术手册。
+- 中英文混合资料。
+
+优点：
+
+- 部署成熟。
+- 效果稳定。
+- 成本适中。
+- 支持 dense + sparse 混合检索。
+
+------
+
+## 13.2 高精度中文 RAG 推荐
+
+```text
+Embedding: Qwen/Qwen3-Embedding-4B 或 Qwen/Qwen3-Embedding-8B
+Reranker: Qwen/Qwen3-Reranker-4B 或 BAAI/bge-reranker-v2-m3
+Deploy: vLLM / SentenceTransformers / Transformers
+```
+
+适合：
+
+- 高质量问答。
+- 复杂中文技术文档。
+- 法律、医学、金融、论文类知识库。
+- 长上下文检索。
+
+缺点：
+
+- 显存占用更高。
+- 吞吐量低于 bge-m3。
+- 工程成本更高。
+
+------
+
+## 13.3 轻量本地 RAG 推荐
+
+```text
+Embedding: EmbeddingGemma / snowflake-arctic-embed2 / all-MiniLM-L6-v2
+Reranker: bge-reranker-base 或不使用 reranker
+Deploy: Ollama / SentenceTransformers
+```
+
+适合：
+
+- 本地笔记本。
+- CPU 环境。
+- Demo。
+- 小规模知识库。
+- 低成本私有部署。
+
+------
+
+## 13.4 游戏知识库 RAG 推荐
+
+结合你前面做的游戏知识库 RAG，推荐：
+
+```text
+Embedding: BAAI/bge-m3
+Reranker: BAAI/bge-reranker-v2-m3
+Milvus 字段:
+  id
+  title
+  chunk_id
+  content
+  content_dense_vector
+  content_sparse_vector
+  doc_id
+```
+
+检索流程：
+
+```text
+原始 Query
+   ↓
+Query 改写 / 扩展
+   ↓
+BGE-M3 dense vector
+   ↓
+BGE-M3 sparse vector
+   ↓
+Milvus dense search + sparse search
+   ↓
+RRF 融合
+   ↓
+bge-reranker-v2-m3 精排
+   ↓
+Top 5 拼接给豆包 / Qwen / DeepSeek / GPT
+```
+
+推荐参数：
+
+| 参数             | 建议               |
+| ---------------- | ------------------ |
+| dense topK       | 50                 |
+| sparse topK      | 50                 |
+| RRF 后候选       | 50-100             |
+| rerank 输入      | 50 条以内优先      |
+| rerank 输出      | Top 5-10           |
+| chunk 长度       | 300-800 中文字左右 |
+| overlap          | 50-150 中文字      |
+| 向量归一化       | 建议开启           |
+| rerank normalize | 建议开启           |
+
+------
+
+# 14. 什么时候必须用 Reranker？
+
+建议使用 Reranker 的场景：
+
+| 场景                       | 是否建议 Reranker        |
+| -------------------------- | ------------------------ |
+| 小型 FAQ，文档少           | 可选                     |
+| 百万级知识库               | 强烈建议                 |
+| 中文技术文档               | 强烈建议                 |
+| 游戏技能 / 装备 / 数值问答 | 强烈建议                 |
+| 法律 / 医学 / 金融         | 必须                     |
+| 代码检索                   | 强烈建议                 |
+| 只做相似文档推荐           | 可选                     |
+| 对响应延迟极敏感           | 可减少 rerank 数量或不用 |
+
+如果知识库里存在大量相似 chunk，比如：
+
+```text
+孙权技能介绍
+孙权技能加点
+孙权出装推荐
+孙权铭文推荐
+孙权连招技巧
+```
+
+那么只靠 embedding 很容易把它们都召回，但不一定把真正答案放在第一位。这时 reranker 的收益很明显。
+
+------
+
+# 15. 模型选型不要只看榜单
+
+MTEB 是目前常用的 embedding benchmark，它覆盖 8 类 embedding 任务、58 个数据集和 112 种语言；原论文也指出，没有单一 embedding 方法能在所有任务上都占优。([arXiv](https://arxiv.org/abs/2210.07316))
+
+所以 RAG 选型要看自己的任务：
+
+| 评估项             | 对应指标                           |
+| ------------------ | ---------------------------------- |
+| Embedding 召回能力 | Recall@20 / Recall@50 / Recall@100 |
+| Reranker 排序能力  | MRR@10 / NDCG@10                   |
+| 最终问答效果       | Answer Accuracy / Faithfulness     |
+| 幻觉率             | Unsupported Claim Rate             |
+| 延迟               | P95 latency                        |
+| 成本               | GPU 显存、吞吐、存储               |
+| 领域适配           | 游戏术语、技能名、装备名、版本号   |
+
+最推荐你自己构建一个小型评测集，例如：
+
+```text
+query, positive_chunk_id, hard_negative_chunk_ids
+```
+
+然后分别测：
+
+```text
+Embedding Recall@50
+Reranker NDCG@10
+最终答案准确率
+```
+
+这样比只看公开榜单更可靠。
+
+------
+
+# 16. 最终推荐方案
+
+## 如果你要做本地 RAG，优先选这三套
+
+### 方案一：最稳妥，适合大多数中文 RAG
+
+```text
+Embedding: BAAI/bge-m3
+Reranker: BAAI/bge-reranker-v2-m3
+部署: FlagEmbedding / Infinity / Xinference / vLLM
+```
+
+这是我最推荐你当前游戏知识库 RAG 使用的组合。
+
+------
+
+### 方案二：高精度，适合 GPU 资源较充足
+
+```text
+Embedding: Qwen/Qwen3-Embedding-4B
+Reranker: Qwen/Qwen3-Reranker-4B 或 bge-reranker-v2-m3
+部署: vLLM + SentenceTransformers / Transformers
+```
+
+如果你更重视中文复杂问题、长文档和技术文档质量，可以选这套。
+
+------
+
+### 方案三：轻量本地，适合笔记本或 CPU
+
+```text
+Embedding: EmbeddingGemma 或 snowflake-arctic-embed2
+Reranker: bge-reranker-base / 不使用 reranker
+部署: Ollama / SentenceTransformers
+```
+
+适合快速 Demo 或资源有限环境。
+
+------
+
+# 17. 对你的游戏 RAG 系统的具体建议
+
+你的系统如果已经使用 Milvus，并且字段包含：
+
+```text
+content_dense_vector
+content_sparse_vector
+```
+
+建议直接采用：
+
+```text
+Embedding 模型：BAAI/bge-m3
+Reranker 模型：BAAI/bge-reranker-v2-m3
+```
+
+原因：
+
+1. BGE-M3 同时支持 dense 和 sparse，正好匹配你的 Milvus 字段设计。
+2. bge-reranker-v2-m3 是轻量多语言 reranker，中文游戏知识库够用。
+3. 两者都能本地部署。
+4. Java 项目可以把模型服务独立成 HTTP 服务，SpringBoot 只负责调用。
+5. 后续如果要升级，可以把 embedding 替换成 Qwen3-Embedding-4B，把 reranker 替换成 Qwen3-Reranker-4B。
+
+推荐架构：
+
+```text
+SpringBoot RAG 服务
+   ↓ HTTP
+Embedding Service: bge-m3 / Qwen3-Embedding
+   ↓
+Milvus Hybrid Search
+   ↓
+RRF Fusion
+   ↓ HTTP
+Reranker Service: bge-reranker-v2-m3
+   ↓
+LLM Service: 豆包 / Qwen / DeepSeek
+```
+
+这样做比把模型直接塞进 Java 进程更稳，也更容易扩展。
