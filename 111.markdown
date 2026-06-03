@@ -155,3 +155,1022 @@ public class MilvusSearchExample {
     }
 }
 
+下面默认把你写的 **Qwen3-Reranket-8B** 理解为 **Qwen3-Reranker-8B**。
+
+## 一句话结论
+
+**追求最高效果、GPU资源充足：选 Qwen3-Embedding-8B + Qwen3-Reranker-8B。**
+**追求本地部署稳定、Milvus混合检索适配、成本可控：选 BAAI/bge-m3 + bge-reranker-v2-m3。**
+
+尤其是你之前的 Milvus 字段设计里有：
+
+```text
+content_dense_vector
+content_sparse_vector
+```
+
+这种情况下，**BGE-M3 更贴合你的现有架构**，因为它本身支持 dense retrieval、sparse retrieval、multi-vector retrieval；Milvus 官方也提供了 BGE-M3 的 dense/sparse 生成示例。([Hugging Face](https://huggingface.co/BAAI/bge-m3))
+
+------
+
+## 1. 核心对比表
+
+| 对比项           | Qwen3-Embedding-8B + Qwen3-Reranker-8B                       | BAAI/bge-m3 + bge-reranker-v2-m3                             |
+| ---------------- | ------------------------------------------------------------ | ------------------------------------------------------------ |
+| 定位             | 高性能大模型级 embedding + rerank                            | 工程友好型多功能 embedding + 轻量 rerank                     |
+| 参数规模         | Embedding 8B，Reranker 8B                                    | bge-m3 约 569M，bge-reranker-v2-m3 约 568M                   |
+| 上下文长度       | 32K                                                          | bge-m3 8192 tokens；reranker-v2-m3 通常也按长文本 rerank 使用 |
+| 向量维度         | Qwen3-Embedding-8B 最高 4096 维，并支持 32 到 4096 自定义输出维度 | bge-m3 dense 通常 1024 维；同时可生成 sparse 向量            |
+| 是否支持稀疏向量 | 官方重点是 dense embedding + MRL + instruction-aware，没有像 BGE-M3 那样主打 sparse/multi-vector 输出 | 支持 dense、sparse、multi-vector 三种能力                    |
+| 多语言           | 100+ 语言                                                    | 100+ 语言，训练覆盖 170+ 语言但不同语言数据不均衡            |
+| 中文效果         | 很强，Qwen 系列中文语义理解优势明显                          | 很强，BGE 系列长期用于中英文检索                             |
+| 代码检索         | Qwen3 官方强调代码检索能力                                   | 可用，但不是最突出的卖点                                     |
+| RAG召回阶段      | 高质量 dense 召回                                            | dense + sparse 混合召回更方便                                |
+| Rerank阶段       | 8B reranker 效果更强，但慢、占显存                           | 568M reranker 更轻，部署简单                                 |
+| 部署成本         | 高，两个 8B 模型本地部署压力大                               | 中低，单机 GPU 甚至部分 CPU 场景都更现实                     |
+| 适合场景         | 追求最终检索质量、长文档、复杂语义、代码/跨语言检索          | Java + Milvus 工程项目、混合检索、成本敏感、本地部署         |
+
+Qwen3-Embedding 系列官方提供 0.6B、4B、8B 三档，Embedding 和 Reranker 都支持 instruction-aware，8B embedding 在 2025 年 6 月 5 日的 MTEB multilingual leaderboard 上官方标注得分 70.58、排名 No.1。([Hugging Face](https://huggingface.co/Qwen/Qwen3-Embedding-8B))
+BGE-M3 官方强调 “Multi-Functionality、Multi-Linguality、Multi-Granularity”，也就是一个模型同时支持 dense、sparse、multi-vector，并支持 8192 token 长文本。([Hugging Face](https://huggingface.co/BAAI/bge-m3))
+
+------
+
+## 2. 具体怎么选
+
+### 方案 A：Qwen3-Embedding-8B + Qwen3-Reranker-8B
+
+适合：
+
+```text
+效果第一
+GPU资源充足
+文档长
+查询复杂
+中文/英文/代码混合
+可以接受较高延迟
+```
+
+优点：
+
+1. **整体效果上限高**
+   Qwen3-Embedding-8B 是目前非常强的 dense embedding 模型，适合复杂语义匹配、长上下文检索、中文问答、代码检索等任务。官方说明其支持 32K 上下文、最高 4096 维向量、100+ 语言。([Hugging Face](https://huggingface.co/Qwen/Qwen3-Embedding-8B))
+2. **Reranker-8B 语义判断更强**
+   8B reranker 更像一个大模型级别的精排器，对“语义相近但答案不相关”的候选文档区分能力更强。适合把 top100/top200 召回结果精排到 top5/top10。
+3. **支持 instruction-aware**
+   可以针对任务写检索指令，例如：
+   “给定一个游戏玩家问题，检索最相关的英雄技能、装备、机制说明文档。”
+   这对垂直领域 RAG 有帮助。Qwen3 官方说明 embedding 和 reranking 都支持自定义 instruction。([GitHub](https://github.com/QwenLM/Qwen3-Embedding))
+
+缺点：
+
+1. **部署成本很高**
+   两个 8B 模型如果 FP16 部署，光权重大致就是十几 GB 级别一个模型，还要算推理缓存、batch、服务框架开销。Embedding 和 Reranker 都上 8B，本地至少建议高显存 GPU；否则吞吐和延迟会比较难看。
+2. **不直接解决 sparse 检索**
+   如果你的 Milvus schema 已经有 `content_sparse_vector`，Qwen3-Embedding-8B 主要用于 dense embedding，不像 BGE-M3 那样一套模型直接给 dense + sparse。因此你要么不用 sparse 字段，要么额外引入 BM25/SPLADE/其他 sparse encoder。
+3. **向量维度变化会影响已有索引**
+   如果你从 bge-m3 的 1024 维切到 Qwen3-Embedding-8B 的 4096 维，需要重建 Milvus collection 或至少重建对应向量字段和索引。
+
+------
+
+### 方案 B：BAAI/bge-m3 + bge-reranker-v2-m3
+
+适合：
+
+```text
+本地部署
+Java + SpringBoot + Milvus
+需要 dense + sparse 混合检索
+成本敏感
+中文/英文为主
+希望工程稳定可落地
+```
+
+优点：
+
+1. **最适合 Milvus 混合检索**
+   BGE-M3 可以同时生成 dense 和 sparse embedding。Milvus 官方文档中，`BGEM3EmbeddingFunction` 会返回 `dense` 和 `sparse` 两类 embedding，dense 维度示例为 1024，sparse 维度示例为 250002。([Milvus](https://milvus.io/docs/embed-with-bgm-m3.md))
+
+2. **模型小很多，部署容易**
+   BGE 文档给出的 bge-m3 规模约 569M，模型大小约 2.27GB；bge-reranker-v2-m3 约 568M，模型大小也约 2.27GB。相比两个 8B 模型，部署成本低很多。([BGE Model](https://bge-model.com/bge/bge_m3.html))
+
+3. **RAG工程链路成熟**
+   典型流程可以直接做：
+
+   ```text
+   Query
+   -> bge-m3 生成 dense + sparse
+   -> Milvus dense 检索 + sparse 检索
+   -> RRF 融合
+   -> bge-reranker-v2-m3 精排
+   -> LLM生成答案
+   ```
+
+4. **bge-reranker-v2-m3 用法简单**
+   Reranker 输入 query 和 passage，直接输出相关性分数，可以用 sigmoid 归一化到 0~1。官方模型卡也明确说明 reranker 与 embedding 不同，是直接对 query-document pair 打分。([Hugging Face](https://huggingface.co/BAAI/bge-reranker-v2-m3))
+
+缺点：
+
+1. **效果上限通常不如 Qwen3 8B 全家桶**
+   特别是复杂推理型查询、长文档、代码检索、跨语言语义细节，Qwen3-8B 组合上限更高。
+2. **上下文长度短于 Qwen3**
+   bge-m3 是 8192 token，而 Qwen3-Embedding/Reranker 是 32K。([Hugging Face](https://huggingface.co/Qwen/Qwen3-Embedding-8B))
+3. **Instruction 能力不如 Qwen3 系列突出**
+   BGE-M3 更像“检索工程模型”，Qwen3-Embedding/Reranker 更像“带任务指令理解能力的大模型检索组件”。
+
+------
+
+## 3. 对你的游戏 RAG 系统的建议
+
+你的项目是：
+
+```text
+Java + SpringBoot
+Milvus 已建
+字段包含 dense_vector + sparse_vector
+游戏知识库 RAG
+Query 改写/扩展 + 多路召回 + RRF + rerank
+```
+
+我更建议优先使用：
+
+```text
+BAAI/bge-m3 + bge-reranker-v2-m3
+```
+
+原因很直接：
+
+```text
+bge-m3 生成 dense_vector
+bge-m3 生成 sparse_vector
+Milvus 同时做 dense + sparse 检索
+RRF 融合
+bge-reranker-v2-m3 精排
+```
+
+这和你现有设计天然匹配。
+
+如果后续你想进一步提高效果，可以升级成：
+
+```text
+BAAI/bge-m3 + Qwen3-Reranker-4B/8B
+```
+
+也就是 **召回继续用 bge-m3，精排换 Qwen3-Reranker**。这样既保留 dense+sparse 混合召回，又提高最后 topK 的语义排序质量。
+
+------
+
+## 4. 推荐组合清单
+
+### 组合 1：效果最强，但最贵
+
+```text
+Qwen3-Embedding-8B + Qwen3-Reranker-8B
+```
+
+适合：
+
+```text
+企业级知识库
+复杂长文档
+代码检索
+跨语言检索
+高显存 GPU
+效果优先于成本
+```
+
+不太适合：
+
+```text
+普通单卡部署
+CPU部署
+高并发低延迟场景
+```
+
+------
+
+### 组合 2：Qwen 平衡版
+
+```text
+Qwen3-Embedding-4B + Qwen3-Reranker-4B
+```
+
+适合：
+
+```text
+想用 Qwen3 系列
+但 8B + 8B 太重
+中文语义检索要求高
+```
+
+这是 Qwen3 系列里比较均衡的方案。Qwen3 官方提供 0.6B、4B、8B 三档 embedding 和 reranker，方便按资源选择。([GitHub](https://github.com/QwenLM/Qwen3-Embedding))
+
+------
+
+### 组合 3：Qwen 轻量版
+
+```text
+Qwen3-Embedding-0.6B + Qwen3-Reranker-0.6B
+```
+
+适合：
+
+```text
+本地轻量部署
+中小型知识库
+不需要 sparse 检索
+希望统一用 Qwen 系列
+```
+
+缺点是效果上限明显低于 4B/8B，但部署成本低很多。
+
+------
+
+### 组合 4：工程落地首选
+
+```text
+BAAI/bge-m3 + bge-reranker-v2-m3
+```
+
+适合：
+
+```text
+Milvus 混合检索
+dense + sparse 字段已经建好
+Java RAG 系统
+中英文知识库
+成本敏感
+```
+
+这是我最推荐你当前项目先跑通的组合。
+
+------
+
+### 组合 5：混合增强版
+
+```text
+BAAI/bge-m3 + Qwen3-Reranker-8B
+```
+
+适合：
+
+```text
+召回阶段想用 dense + sparse
+精排阶段想要更强语义判断
+GPU资源还可以
+```
+
+这套很适合你的架构升级：
+
+```text
+召回：bge-m3 dense + sparse
+融合：RRF
+精排：Qwen3-Reranker-8B
+生成：豆包/其他 LLM
+```
+
+实际工程上，reranker 只处理 top50/top100 候选，不处理全库，所以即使用 8B reranker，也比全库重算 embedding 更现实。
+
+------
+
+### 组合 6：经典多语言方案
+
+```text
+intfloat/multilingual-e5-large-instruct + bge-reranker-v2-m3
+```
+
+适合：
+
+```text
+多语言文本
+英文/中文/跨语言检索
+资源中等
+不需要 sparse 向量
+```
+
+multilingual-e5-large 支持 100 种语言，multilingual-e5-large-instruct 是常用的多语言指令式 embedding 模型。([Hugging Face](https://huggingface.co/intfloat/multilingual-e5-large?utm_source=chatgpt.com))
+
+------
+
+### 组合 7：Jina 多语言长文本方案
+
+```text
+jina-embeddings-v3 + jina-reranker-v2-base-multilingual
+```
+
+适合：
+
+```text
+多语言
+长文本
+需要较灵活的 embedding 维度
+希望 embedding 和 reranker 都用 Jina 生态
+```
+
+Jina Embeddings v3 是 570M 级别模型，支持 8192 token，并支持 Matryoshka Representation Learning，可把输出维度降到较低维度；Jina Reranker v2 是多语言 cross-encoder reranker。([arXiv](https://arxiv.org/abs/2409.10173?utm_source=chatgpt.com))
+
+------
+
+### 组合 8：低资源快速版
+
+```text
+sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
++ bge-reranker-base / bge-reranker-v2-m3
+```
+
+适合：
+
+```text
+CPU部署
+小知识库
+实验验证
+低延迟
+效果要求不极致
+```
+
+MiniLM 多语言模型输出 384 维向量，部署非常轻，但检索效果和长文本能力不能和 Qwen3/BGE-M3/Jina-v3 这类模型比。([Hugging Face](https://huggingface.co/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2?utm_source=chatgpt.com))
+
+------
+
+## 5. 最推荐你的三档选择
+
+### 第一档：先跑通、最稳
+
+```text
+Embedding: BAAI/bge-m3
+Reranker: BAAI/bge-reranker-v2-m3
+Vector DB: Milvus dense + sparse
+Fusion: RRF
+```
+
+这是最适合你当前 Java + Milvus 游戏 RAG 的方案。
+
+------
+
+### 第二档：效果增强
+
+```text
+Embedding: BAAI/bge-m3
+Reranker: Qwen3-Reranker-4B 或 Qwen3-Reranker-8B
+Vector DB: Milvus dense + sparse
+Fusion: RRF
+```
+
+保留 BGE-M3 的混合召回优势，同时提高精排效果。
+
+------
+
+### 第三档：效果优先、重构索引
+
+```text
+Embedding: Qwen3-Embedding-8B
+Reranker: Qwen3-Reranker-8B
+Vector DB: Milvus dense only 或 dense + 额外 sparse 模型
+```
+
+这个方案效果上限高，但如果你原来用的是 bge-m3 的 1024 维 dense 和 sparse，就需要重新建索引或新增向量字段。
+
+------
+
+## 6. 最后给一个直接建议
+
+如果你现在是为了毕业设计/项目落地/Java RAG 系统能稳定跑：
+
+```text
+优先选：BAAI/bge-m3 + bge-reranker-v2-m3
+```
+
+如果你后面要做“效果提升版”：
+
+```text
+召回不动：BAAI/bge-m3
+精排升级：Qwen3-Reranker-4B / 8B
+```
+
+如果你要做“最强实验版”：
+
+```text
+Qwen3-Embedding-8B + Qwen3-Reranker-8B
+```
+
+但这时要准备重建 Milvus 向量索引，并重新考虑 sparse 检索来源。下面的“记忆系统”不是指简单把历史对话塞进 prompt，而是指：**RAG 仍负责查静态知识库，Memory 负责持续沉淀用户、任务、偏好、事件、历史结论、失败经验，并在下一次检索/生成时参与上下文构造**。
+
+## 1. 核心结论
+
+把 RAG 放进记忆系统，最佳架构不是“RAG + 历史聊天记录”，而是：
+
+> **静态知识库 RAG + 动态长期记忆 Memory + 短期会话状态 + 可控写入/更新机制**
+
+传统 RAG 主要解决“从文档中查资料”；Memory-RAG 解决的是“系统长期与用户/任务共同演化”。Mem0 的论文把长期记忆系统定义为对持续会话中的关键信息进行**提取、合并、检索**，并显示相较 full-context 方式可以显著降低 token 和延迟成本；Zep/Graphiti 则把记忆建成**时间感知知识图谱**，用于处理事实变化、跨会话关系和时间推理。([arXiv](https://arxiv.org/abs/2504.19413?utm_source=chatgpt.com))
+
+对你现在的 Java/SpringBoot 游戏 RAG 项目来说，最适合落地的是：
+
+1. **第一阶段：Milvus 中新增 memory_collection**，把用户偏好、历史问答、任务状态作为动态记忆向量库。
+2. **第二阶段：加 Memory Extractor 写入链路**，每次回答后抽取“值得长期保存”的记忆。
+3. **第三阶段：引入图记忆**，用 Neo4j/Memgraph/Graphiti 管理角色、技能、版本、装备、玩法之间的时序关系。
+4. **第四阶段：做记忆治理**，包括去重、冲突检测、过期、用户删除、权限隔离、重要性评分。
+
+------
+
+## 2. 为什么“RAG 不是 Memory”
+
+很多系统把历史对话 summary 或最近 N 轮聊天当作 memory，这只能算**短期上下文**。真正的记忆系统至少要有四类能力：
+
+| 类型         | 作用               | 示例                                       |
+| ------------ | ------------------ | ------------------------------------------ |
+| 短期记忆     | 当前会话上下文     | 最近几轮对话、当前任务状态                 |
+| 长期语义记忆 | 长期稳定事实       | 用户偏好“喜欢王者荣耀打野英雄”             |
+| 情节记忆     | 带时间的历史事件   | “2026-06-01 用户问过澜的出装”              |
+| 程序性记忆   | 系统学到的处理方式 | “用户问英雄攻略时优先给技能连招+铭文+出装” |
+| 图记忆       | 实体关系与变化     | “孙策—克制—后羿”“版本 15.2 调整了某技能”   |
+
+LangChain/LangGraph 的记忆文档也区分了 thread-scoped short-term memory 和跨会话长期记忆；Letta 则把“核心记忆”固定注入上下文，把“归档记忆”放在可语义检索的外部存储中。([LangChain 文档](https://docs.langchain.com/oss/python/concepts/memory?utm_source=chatgpt.com))
+
+------
+
+## 3. 代表性开源项目调研
+
+### 3.1 Mem0：最适合“快速给 RAG 加长期记忆层”
+
+Mem0 是一个面向 AI Agent 和应用的通用记忆层，核心目标是记住用户偏好、适配个人需求，并随着交互持续学习。它的论文提出通过动态抽取、合并和检索长期记忆来替代简单 full-context，对 LoCoMo 长期会话记忆任务进行了评测；论文中报告 Mem0 相比 full-context 方法降低了约 91% p95 延迟，并节省 90% 以上 token 成本。([GitHub](https://github.com/mem0ai/mem0?utm_source=chatgpt.com))
+
+适合场景：
+
+- 个人助手、客服机器人、游戏 RAG 助手。
+- 希望低成本加入“用户长期偏好”。
+- 不想一开始就维护复杂知识图谱。
+
+放进你的 RAG 项目时，可以这样用：
+
+```text
+用户 Query
+  -> 查询用户长期记忆 Mem0 / 自建 memory_collection
+  -> 查询游戏知识库 Milvus
+  -> 融合记忆上下文 + RAG 文档
+  -> LLM 生成
+  -> 从本轮对话抽取新记忆
+  -> 写入 Memory
+```
+
+优点是接入快，偏工程化；缺点是如果游戏知识具有大量实体关系、版本变化、克制关系，仅靠向量记忆容易产生重复、冲突和时序错误。
+
+------
+
+### 3.2 Zep / Graphiti：最适合“动态知识图谱记忆”
+
+Zep 的开源核心是 Graphiti，它是用于 AI Agent 记忆的时间感知上下文图谱框架，可以实时增量更新图结构，并支持混合检索。Zep 论文明确指出，传统 RAG 多面向静态文档检索，而企业/Agent 场景需要把 ongoing conversations 和业务数据动态合成为长期记忆；Graphiti 正是用于维护事实、关系和历史变化。([getzep.com](https://www.getzep.com/product/open-source/?utm_source=chatgpt.com))
+
+适合场景：
+
+- 需要处理“事实会变”的系统。
+- 有大量实体关系：用户、英雄、装备、技能、版本、阵容、打法。
+- 需要回答时间相关问题：以前怎么问过、某版本之前/之后有什么变化。
+
+对游戏 RAG 很有价值。例如：
+
+```text
+实体：
+  英雄：澜、孙策、后羿
+  装备：暗影战斧、宗师之力
+  版本：S35、S36
+  用户：user_001
+
+关系：
+  user_001 偏好 英雄=澜
+  澜 适合 打野
+  澜 在 S36 被削弱 技能二
+  暗影战斧 适合 战士/刺客
+```
+
+优点是可以解决向量库难处理的“关系 + 时间 + 冲突”；缺点是架构复杂，需要实体抽取、关系抽取、图谱更新和图检索。
+
+------
+
+### 3.3 Letta / MemGPT：最适合“记忆优先 Agent 架构”
+
+Letta 是从 MemGPT 演进来的状态化 Agent 平台，强调 Agent 可以拥有可持久化、可自我修改的记忆。它的核心记忆块会长期固定在上下文中；归档记忆则是可语义检索的大规模长期存储，不会一直占用上下文窗口。([GitHub](https://github.com/letta-ai/letta?utm_source=chatgpt.com))
+
+Letta 的启发意义很强：你可以把记忆分成两层。
+
+```text
+Core Memory：少量高价值、长期稳定、每次都放进 prompt
+例如：
+- 用户主要玩王者荣耀
+- 用户偏好 Java/SpringBoot 方案
+- 用户更喜欢完整项目代码和可落地实现
+
+Archival Memory：大量历史信息，需要时检索
+例如：
+- 用户上次问过澜的打野出装
+- 用户之前项目使用 Milvus + BGE-M3
+- 某次回答中已经生成过 Query 改写方案
+```
+
+适合场景：
+
+- 想做“会持续学习的 Agent”。
+- Agent 不只是问答，还要维护自身任务状态。
+- 需要多 Agent 协作和长期任务记忆。
+
+缺点是它更偏 Agent 平台，不是单纯 RAG 组件；如果你的主项目是 Java/SpringBoot，直接深度集成成本会比 Mem0 更高。
+
+------
+
+### 3.4 LangMem / LangGraph：最适合“Agent 工作流中的可编程记忆”
+
+LangMem 是 LangChain 生态中的长期记忆 SDK，用于从对话中抽取重要信息、优化 Agent 行为、维护长期记忆，并且可以和 LangGraph 的持久化存储集成。([GitHub](https://github.com/langchain-ai/langmem?utm_source=chatgpt.com))
+
+它的价值在于提供了一套“记忆写入/更新”的工程范式：
+
+```text
+对话结束
+  -> 判断是否值得记忆
+  -> 抽取 facts / preferences / episodes / procedures
+  -> 合并已有记忆
+  -> 更新 Agent 行为提示词
+```
+
+适合 Python/LangGraph 项目。如果你坚持 Java 主栈，可以参考它的设计，不一定直接引入。
+
+------
+
+### 3.5 LlamaIndex Memory：适合文档 RAG + Agent 的轻量记忆
+
+LlamaIndex 在 2025 年改进了 Agent 的长短期记忆组件，官方文档说明其 Memory 可以同时包含短期 FIFO 消息队列和长期记忆块，用于在 Agent 应用中保存和抽取跨时间的信息。([llamaindex.ai](https://www.llamaindex.ai/blog/improved-long-and-short-term-memory-for-llamaindex-agents?utm_source=chatgpt.com))
+
+适合场景：
+
+- 文档 RAG 已经用 LlamaIndex。
+- 想在 Python 里快速搭建多轮问答 + 长期记忆。
+- 对复杂图谱记忆要求不高。
+
+缺点是对 Java 项目不够直接。
+
+------
+
+### 3.6 Cognee：偏“图记忆 + 语义记忆控制平面”
+
+Cognee 是一个开源 AI Agent 记忆控制平面，强调把数据转成图记忆，并结合 embeddings、图结构和认知科学方法，使文档既能语义搜索，也能通过关系连接起来。([GitHub](https://github.com/topoteretes/cognee?utm_source=chatgpt.com))
+
+适合场景：
+
+- 想做 GraphRAG + Memory。
+- 文档来源复杂，需要持续更新和结构化。
+- 希望把“知识库”和“记忆库”统一成一个可检索的图。
+
+对游戏 RAG 来说，如果你要处理“英雄—装备—铭文—版本—阵容—用户偏好”的关系网络，Cognee/Graphiti 这类思路很值得参考。
+
+------
+
+### 3.7 Haystack：适合生产 RAG 管道中的短期会话记忆
+
+Haystack 是生产级开源 RAG/Agent 编排框架，支持检索、路由、记忆和生成等模块化流水线；其 conversational RAG 教程展示了如何存储、检索和复用聊天历史，让系统在多轮文档问答中保留上下文。([GitHub](https://github.com/deepset-ai/haystack?utm_source=chatgpt.com))
+
+适合场景：
+
+- 生产 RAG pipeline。
+- 想把检索、路由、生成拆成明确组件。
+- 主要需要 session 级记忆，而不是复杂长期用户画像。
+
+------
+
+### 3.8 Dify / OpenWebUI / LibreChat / AnythingLLM：偏完整应用平台
+
+这类项目不是单纯 memory framework，而是可以直接部署的 RAG/Agent 应用。
+
+OpenWebUI 支持知识库和 RAG，可以上传文件、构建知识库并让模型检索相关信息；LibreChat 提供 RAG API，并且有 User Memory，采用 key/value 方式保存跨会话用户信息；Dify 提供知识库和 conversation variables，用于在工作流中保存对话变量；AnythingLLM 支持文档嵌入、RAG 和 reranking。([Open WebUI](https://docs.openwebui.com/features/?utm_source=chatgpt.com))
+
+适合场景：
+
+- 你想快速搭一个产品原型。
+- 不想自己写完整 UI、用户管理、文件上传、知识库管理。
+- 需要验证“RAG + 记忆”产品形态。
+
+但如果你的目标是写论文/项目/后端系统，建议不要直接套这些平台，而是学习它们的模块拆分。
+
+------
+
+## 4. 项目选择建议
+
+| 目标                             | 推荐方案                                          |
+| -------------------------------- | ------------------------------------------------- |
+| 快速给现有 RAG 增加长期记忆      | Mem0 思路 / 自建 memory_collection                |
+| 处理事实变化、版本变化、实体关系 | Graphiti / Zep 思路                               |
+| 做会自我维护记忆的 Agent         | Letta                                             |
+| Python Agent 工作流              | LangMem + LangGraph                               |
+| 文档 RAG + 轻量记忆              | LlamaIndex Memory                                 |
+| 图谱化知识与记忆统一             | Cognee / Graphiti                                 |
+| 快速做产品 Demo                  | Dify / OpenWebUI / LibreChat / AnythingLLM        |
+| Java/SpringBoot 项目落地         | 自建 Memory Service + Milvus + MySQL + 可选 Neo4j |
+
+------
+
+## 5. 面向你当前 Java RAG 项目的落地架构
+
+你现在已有的 RAG 流程大概是：
+
+```text
+Query
+ -> Query 理解
+ -> Milvus 检索
+ -> RRF / rerank
+ -> Prompt 组装
+ -> LLM 生成
+```
+
+改成 Memory-RAG 后应变为：
+
+```text
+User Query
+  -> Session Memory 读取
+  -> Long-term Memory 检索
+  -> Query 理解/改写
+  -> 游戏知识库 RAG 检索
+  -> 记忆结果 + 知识库结果融合
+  -> Rerank
+  -> Prompt 组装
+  -> LLM 生成
+  -> Memory Extractor 抽取新记忆
+  -> Memory Updater 去重/合并/冲突处理/写入
+```
+
+### 新增模块
+
+```text
+com.example.gamerag.memory
+├── MemoryController.java
+├── MemoryService.java
+├── MemoryExtractorService.java
+├── MemoryRetrieverService.java
+├── MemoryUpdateService.java
+├── MemoryConflictService.java
+├── MemoryScoringService.java
+├── MemoryPromptAssembler.java
+├── model
+│   ├── MemoryItem.java
+│   ├── MemoryType.java
+│   ├── MemoryCandidate.java
+│   └── MemorySearchResult.java
+└── repository
+    ├── MemoryMysqlRepository.java
+    └── MemoryMilvusRepository.java
+```
+
+------
+
+## 6. 记忆数据表设计
+
+### MySQL：保存结构化元数据
+
+```sql
+CREATE TABLE rag_memory (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    memory_id VARCHAR(64) NOT NULL UNIQUE,
+    user_id VARCHAR(64) NOT NULL,
+    session_id VARCHAR(64),
+    namespace VARCHAR(64) DEFAULT 'game-rag',
+
+    memory_type VARCHAR(32) NOT NULL,
+    subject VARCHAR(128),
+    content TEXT NOT NULL,
+
+    entities_json JSON,
+    source_query TEXT,
+    source_answer TEXT,
+
+    importance DOUBLE DEFAULT 0.5,
+    confidence DOUBLE DEFAULT 0.8,
+    access_count INT DEFAULT 0,
+
+    valid_from DATETIME,
+    valid_to DATETIME,
+    status VARCHAR(32) DEFAULT 'ACTIVE',
+
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+    INDEX idx_user_type (user_id, memory_type),
+    INDEX idx_user_status (user_id, status),
+    INDEX idx_subject (subject)
+);
+```
+
+### Milvus：保存向量记忆
+
+```text
+collection: rag_memory_vector
+
+字段：
+- memory_id: VarChar
+- user_id: VarChar
+- session_id: VarChar
+- namespace: VarChar
+- memory_type: VarChar
+- content: VarChar
+- dense_vector: FloatVector
+- sparse_vector: SparseFloatVector
+- importance: Float
+- confidence: Float
+- timestamp: Int64
+```
+
+如果你已经在游戏知识库中使用 BGE-M3，那么 memory_collection 也可以继续用 BGE-M3，因为它同时适合中英文和 dense/sparse hybrid 检索。
+
+------
+
+## 7. 记忆类型设计
+
+建议定义：
+
+```java
+public enum MemoryType {
+    USER_PROFILE,       // 用户画像
+    USER_PREFERENCE,    // 用户偏好
+    TASK_STATE,         // 当前任务状态
+    EPISODIC_EVENT,     // 历史事件
+    DOMAIN_FACT,        // 领域事实
+    PROCEDURAL_RULE,    // 处理规则
+    FEEDBACK,           // 用户反馈
+    FAILURE_CASE        // 失败经验
+}
+```
+
+游戏 RAG 示例：
+
+```text
+USER_PREFERENCE:
+用户喜欢王者荣耀打野英雄，回答时希望包含连招、铭文、出装。
+
+TASK_STATE:
+用户正在构建基于 Java/SpringBoot + Milvus 的游戏知识库 RAG 系统。
+
+EPISODIC_EVENT:
+用户曾要求去掉关键词检索，只保留 dense_vector 和 sparse_vector 两种向量检索。
+
+PROCEDURAL_RULE:
+当用户要求完整项目代码时，应给出文件树、pom.xml、application.yml、核心 Java 类和运行方式。
+```
+
+------
+
+## 8. 检索融合方案
+
+记忆检索不要和知识库检索混为一个库，建议双路召回：
+
+```text
+Route A：Memory Retrieval
+- 查用户长期记忆
+- 查当前 session summary
+- 查任务状态
+- 查历史偏好
+
+Route B：Knowledge RAG Retrieval
+- 查游戏知识库
+- 查英雄/装备/技能/玩法文档
+- 查版本资料
+```
+
+融合排序可以用：
+
+```text
+final_score =
+  0.35 * semantic_score
++ 0.20 * sparse_score
++ 0.15 * recency_score
++ 0.15 * importance_score
++ 0.10 * entity_match_score
++ 0.05 * access_frequency_score
+- 0.30 * expired_or_conflict_penalty
+```
+
+其中：
+
+```text
+recency_score = exp(- days_since_update / tau)
+importance_score = LLM 或规则打分
+entity_match_score = Query 中英雄/装备/版本是否命中
+conflict_penalty = 与新事实冲突或已过期
+```
+
+------
+
+## 9. Prompt 组装方式
+
+不要把所有记忆都塞进去。建议分层：
+
+```text
+[System]
+你是游戏知识库 RAG 助手，回答必须基于检索证据，不确定时说明不确定。
+
+[Core Memory]
+- 用户偏好 Java/SpringBoot/Milvus 可落地方案。
+- 用户希望回答包含完整代码结构和修改位置。
+
+[Task Memory]
+- 当前任务：为游戏 RAG 系统设计记忆层。
+- 已有基础：Milvus 向量库、BGE-M3、bge-reranker、豆包 LLM。
+
+[Retrieved Long-term Memories]
+1. 用户之前要求去掉关键词检索，只保留 dense/sparse 两路向量。
+2. 用户项目字段包括 id/title/chunk_id/content/dense_vector/sparse_vector/doc_id。
+
+[Retrieved Knowledge]
+1. 来自游戏知识库的英雄技能片段。
+2. 来自版本文档的装备改动片段。
+
+[User Question]
+...
+```
+
+这样比“历史对话全文 + RAG 文档”更稳定。
+
+------
+
+## 10. 写入记忆的关键：不要什么都存
+
+每轮回答后增加一个 Memory Extractor：
+
+```text
+输入：
+- user_query
+- assistant_answer
+- session_context
+- retrieved_docs
+
+输出：
+- candidate_memories[]
+```
+
+抽取规则：
+
+```text
+应该保存：
+- 用户明确偏好
+- 项目长期配置
+- 反复出现的问题
+- 用户纠正过的事实
+- 当前任务状态
+- 可复用处理规则
+
+不应该保存：
+- 一次性闲聊
+- 临时数字
+- 低置信度推测
+- 敏感信息
+- 与已有记忆重复的信息
+```
+
+LLM 抽取 prompt 示例：
+
+```text
+请从以下对话中抽取值得长期保存的记忆。
+只抽取未来仍可能有用的信息。
+不要保存临时、隐私、敏感、重复的信息。
+
+输出 JSON：
+[
+  {
+    "type": "USER_PREFERENCE | TASK_STATE | DOMAIN_FACT | PROCEDURAL_RULE | EPISODIC_EVENT",
+    "content": "...",
+    "subject": "...",
+    "importance": 0.0-1.0,
+    "confidence": 0.0-1.0,
+    "reason": "为什么值得保存"
+  }
+]
+```
+
+------
+
+## 11. 冲突处理机制
+
+记忆系统最容易出问题的是“旧记忆污染新回答”。
+
+例如：
+
+```text
+旧记忆：用户项目使用关键词检索 + 向量检索。
+新记忆：用户要求删除关键词检索，只保留 dense/sparse 两种向量检索。
+```
+
+处理方式：
+
+```text
+1. 新记忆写入前，先按 subject 检索相似旧记忆。
+2. 如果语义冲突，让 LLM 判断：
+   - replace：新记忆替换旧记忆
+   - merge：合并
+   - keep_both：保留但标注时间
+   - reject：拒绝写入
+3. 旧记忆 status 改成 SUPERSEDED。
+```
+
+MySQL 可以保留：
+
+```text
+status:
+- ACTIVE
+- SUPERSEDED
+- DELETED
+- EXPIRED
+- LOW_CONFIDENCE
+```
+
+------
+
+## 12. 最小可行版本 MVP
+
+如果你现在要最快落地，我建议这样做：
+
+### MVP 版本
+
+```text
+技术栈：
+- Java SpringBoot
+- MySQL：记忆元数据
+- Milvus：记忆向量
+- BGE-M3：记忆 embedding
+- bge-reranker：记忆 + 知识库结果统一精排
+- 豆包 LLM：抽取记忆 + 生成回答
+```
+
+### 接口
+
+```text
+POST /memory/add
+POST /memory/search
+POST /memory/delete
+GET  /memory/list?userId=xxx
+
+POST /rag/chat
+```
+
+### 核心流程
+
+```text
+/chat:
+1. 接收 userId + query
+2. memoryService.search(userId, query)
+3. queryUnderstandingService.rewrite(query, memories)
+4. knowledgeRetriever.search(rewrittenQuery)
+5. rerank(memories + docs)
+6. llm.generate(prompt)
+7. memoryExtractor.extract(query, answer)
+8. memoryUpdater.upsert(candidates)
+```
+
+------
+
+## 13. 推荐最终架构
+
+```text
+                    ┌─────────────────────┐
+                    │      User Query      │
+                    └──────────┬──────────┘
+                               │
+                    ┌──────────▼──────────┐
+                    │  Query Understanding │
+                    └──────┬────────┬─────┘
+                           │        │
+              ┌────────────▼─┐    ┌─▼────────────────┐
+              │ Memory Search │    │ Knowledge Search │
+              │ Milvus/MySQL  │    │ Milvus/MySQL     │
+              └──────┬───────┘    └──────┬───────────┘
+                     │                   │
+                     └─────────┬─────────┘
+                               ▼
+                    ┌─────────────────────┐
+                    │ Fusion + Reranking  │
+                    └──────────┬──────────┘
+                               ▼
+                    ┌─────────────────────┐
+                    │ Prompt Assembly     │
+                    └──────────┬──────────┘
+                               ▼
+                    ┌─────────────────────┐
+                    │ LLM Generation      │
+                    └──────────┬──────────┘
+                               ▼
+                    ┌─────────────────────┐
+                    │ Memory Extraction   │
+                    └──────────┬──────────┘
+                               ▼
+                    ┌─────────────────────┐
+                    │ Dedup / Conflict    │
+                    └──────────┬──────────┘
+                               ▼
+                    ┌─────────────────────┐
+                    │ Memory Store        │
+                    └─────────────────────┘
+```
+
+------
+
+## 14. 最推荐参考组合
+
+对你的方向，我建议优先参考这三个：
+
+1. **Mem0：学习长期记忆抽取、合并、检索的工程范式**。它最像“给现有 RAG 外挂一个记忆层”。([GitHub](https://github.com/mem0ai/mem0?utm_source=chatgpt.com))
+2. **Graphiti/Zep：学习时间感知图记忆**。它适合解决游戏知识库中版本变化、实体关系、上下文演化的问题。([Zep](https://help.getzep.com/graphiti/getting-started/welcome?utm_source=chatgpt.com))
+3. **Letta：学习核心记忆 + 归档记忆的分层思想**。它适合设计长期稳定记忆与大规模检索记忆的边界。([Letta Docs](https://docs.letta.com/guides/core-concepts/memory/memory-blocks/?utm_source=chatgpt.com))
+
+你的 Java 项目不一定要直接依赖这些框架，最好是**借鉴它们的架构，自建 Memory Service**。这样和你已有的 Milvus、BGE-M3、bge-reranker、豆包 LLM、SpringBoot 项目最容易融合。
