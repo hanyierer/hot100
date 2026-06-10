@@ -722,4 +722,1135 @@ POST /rewrite
 可用但不优先：google-t5/t5-large
 ```
 
-如果只是英文知识库或英文 Query 改写，`google-t5/t5-large` 更合适。
+如果只是英文知识库或英文 Query 改写，`google-t5/t5-large` 更合适。下面给出一个**微调 BERT 实现 RAG 系统意图识别**的完整方案，面向你之前的 RAG 在线检索流程：
+
+> 用户 Query → 意图识别 → Query 改写/扩展 → 检索策略路由 → Milvus / 关键词 / 资讯库召回 → Rerank → LLM 生成
+
+这里将意图分为三类：
+
+| 意图类别 | 含义                                                 | 示例 Query                                     | RAG 策略                         |
+| -------- | ---------------------------------------------------- | ---------------------------------------------- | -------------------------------- |
+| 资料类   | 查固定知识、角色属性、技能说明、装备说明、背景设定等 | “孙尚香一技能是什么？”、“影刃属性是什么？”     | 查静态知识库，重视准确性         |
+| 资讯类   | 查最新活动、版本更新、公告、新闻、赛季变化等         | “最新版本更新了什么？”、“这个赛季有什么活动？” | 查资讯库，按时间过滤，重视时效性 |
+| 攻略类   | 查玩法、出装、连招、阵容、技巧、打法等               | “李白怎么玩？”、“打野开局路线怎么选？”         | 查攻略知识，召回更多步骤型内容   |
+
+------
+
+# 一、整体方案
+
+## 1. 模块位置
+
+在 RAG 系统中，BERT 意图识别模块应该放在 **Query 理解阶段的最前面**。
+
+完整流程如下：
+
+```text
+用户 Query
+   ↓
+BERT 意图识别
+   ↓
+根据意图选择不同 Query 处理方式
+   ↓
+Query 改写 / 扩展 / 关键词提取
+   ↓
+根据意图选择不同检索策略
+   ↓
+Milvus 向量召回 / 关键词召回 / 资讯库召回
+   ↓
+Reranker 精排
+   ↓
+LLM 生成最终回答
+```
+
+意图识别结果可以设计成：
+
+```json
+{
+  "query": "李白怎么玩？",
+  "intent": "guide",
+  "intent_name": "攻略类",
+  "confidence": 0.9821
+}
+```
+
+------
+
+# 二、意图类别设计
+
+建议内部使用英文标签，方便代码维护。
+
+```text
+资料类：document
+资讯类：news
+攻略类：guide
+```
+
+也可以设计成枚举：
+
+```java
+public enum QueryIntent {
+    DOCUMENT, // 资料类
+    NEWS,     // 资讯类
+    GUIDE,    // 攻略类
+    UNKNOWN   // 低置信度兜底
+}
+```
+
+------
+
+# 三、数据集构建
+
+## 1. 数据格式
+
+建议使用 CSV 或 JSONL。
+
+CSV 格式：
+
+```csv
+query,label
+孙尚香一技能是什么,document
+影刃这件装备有什么属性,document
+王者荣耀最新版本更新了什么,news
+这个赛季有哪些新活动,news
+李白怎么玩,guide
+韩信打野路线怎么选,guide
+```
+
+JSONL 格式：
+
+```json
+{"query": "孙尚香一技能是什么", "label": "document"}
+{"query": "王者荣耀最新版本更新了什么", "label": "news"}
+{"query": "李白怎么玩", "label": "guide"}
+```
+
+------
+
+## 2. 每类数据量建议
+
+如果是初期可用版本：
+
+| 数据规模          | 效果                 |
+| ----------------- | -------------------- |
+| 每类 300 条       | 可以跑通，但泛化一般 |
+| 每类 1000 条      | 基本可用             |
+| 每类 3000 条以上  | 效果比较稳定         |
+| 每类 10000 条以上 | 适合正式上线         |
+
+对于你的 RAG 系统，建议初期至少准备：
+
+```text
+资料类：1000 条
+资讯类：1000 条
+攻略类：1000 条
+总计：3000 条左右
+```
+
+数据划分：
+
+```text
+训练集：80%
+验证集：10%
+测试集：10%
+```
+
+------
+
+## 3. 三类样本示例
+
+### 资料类 document
+
+这类 Query 通常是在问固定知识。
+
+```text
+孙权的技能是什么
+孙尚香的一技能有什么效果
+影刃的装备属性是什么
+破军适合哪些英雄
+王者荣耀里蓝 buff 有什么作用
+红 buff 的刷新时间是多少
+刘备的被动技能介绍
+小乔的大招叫什么
+防御塔机制是什么
+主宰和暴君有什么区别
+```
+
+### 资讯类 news
+
+这类 Query 通常有“最新、版本、活动、赛季、更新、公告、上线、调整”等词。
+
+```text
+最新版本更新了什么
+这个赛季有什么活动
+王者荣耀今天有什么公告
+新英雄什么时候上线
+最近哪些英雄被削弱了
+S36 赛季改动有哪些
+周年庆活动有什么奖励
+体验服最近更新了什么
+本周限免英雄有哪些
+最近皮肤返场消息
+```
+
+### 攻略类 guide
+
+这类 Query 通常是在问“怎么玩、怎么打、怎么出装、连招、打法、技巧、阵容”。
+
+```text
+李白怎么玩
+韩信打野怎么刷野
+孙尚香怎么出装
+后羿怎么打团
+貂蝉连招顺序是什么
+新手适合玩什么英雄
+打野前期怎么带节奏
+射手怎么防刺客
+王者荣耀怎么上分
+吕布对线怎么打
+```
+
+------
+
+# 四、BERT 微调模型设计
+
+## 1. 模型结构
+
+使用 BERT 做三分类：
+
+```text
+输入 Query
+   ↓
+Tokenizer 分词
+   ↓
+BERT 编码
+   ↓
+取 [CLS] 向量
+   ↓
+全连接分类层
+   ↓
+Softmax 输出三类概率
+```
+
+数学形式可以写成：
+
+```text
+h_cls = BERT(query)[CLS]
+p = softmax(W h_cls + b)
+```
+
+其中：
+
+```text
+p_document = 资料类概率
+p_news = 资讯类概率
+p_guide = 攻略类概率
+```
+
+训练目标使用交叉熵损失：
+
+```text
+L = - Σ y_i log(p_i)
+```
+
+------
+
+## 2. 推荐模型
+
+中文 RAG 系统可以选择：
+
+| 模型                        | 说明                       | 推荐程度 |
+| --------------------------- | -------------------------- | -------- |
+| bert-base-chinese           | 官方中文 BERT，稳定        | 推荐     |
+| hfl/chinese-roberta-wwm-ext | 中文效果通常比原始 BERT 好 | 很推荐   |
+| hfl/chinese-macbert-base    | 中文语义理解较好           | 很推荐   |
+| TinyBERT                    | 推理快，适合低延迟         | 部署推荐 |
+| DistilBERT                  | 速度较快                   | 可选     |
+
+如果只是做三分类，推荐优先选择：
+
+```text
+hfl/chinese-macbert-base
+```
+
+或者：
+
+```text
+hfl/chinese-roberta-wwm-ext
+```
+
+如果部署机器性能一般，可以选择：
+
+```text
+uer/chinese_roberta_L-4_H-512
+TinyBERT
+```
+
+------
+
+# 五、训练参数建议
+
+对于三分类任务，参数可以这样设置：
+
+```text
+max_length = 64
+batch_size = 16 或 32
+learning_rate = 2e-5
+epochs = 3 到 5
+weight_decay = 0.01
+warmup_ratio = 0.1
+dropout = 0.1
+optimizer = AdamW
+loss = CrossEntropyLoss
+```
+
+为什么 `max_length = 64` 就够？
+
+因为意图识别的输入通常很短，例如：
+
+```text
+李白怎么玩
+最新版本更新了什么
+孙尚香技能介绍
+```
+
+大多数 Query 不超过 30 个中文字符，所以没必要设置成 128 或 256。长度越短，推理越快。
+
+------
+
+# 六、训练代码示例
+
+下面是一个基于 Hugging Face Transformers 的核心训练示例。
+
+## 1. 安装依赖
+
+```bash
+pip install torch transformers datasets scikit-learn pandas
+```
+
+------
+
+## 2. 数据格式
+
+假设数据文件是：
+
+```text
+data/intent_train.csv
+data/intent_valid.csv
+```
+
+内容如下：
+
+```csv
+query,label
+孙尚香一技能是什么,document
+最新版本更新了什么,news
+李白怎么玩,guide
+```
+
+------
+
+## 3. 训练代码
+
+文件名：
+
+```text
+train_intent_bert.py
+```
+
+代码：
+
+```python
+import pandas as pd
+import torch
+from datasets import Dataset
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+from transformers import (
+    AutoTokenizer,
+    AutoModelForSequenceClassification,
+    TrainingArguments,
+    Trainer
+)
+
+MODEL_NAME = "hfl/chinese-macbert-base"
+
+label2id = {
+    "document": 0,
+    "news": 1,
+    "guide": 2
+}
+
+id2label = {
+    0: "document",
+    1: "news",
+    2: "guide"
+}
+
+
+def load_csv(path):
+    df = pd.read_csv(path)
+    df["label"] = df["label"].map(label2id)
+    return Dataset.from_pandas(df)
+
+
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+
+
+def tokenize_function(example):
+    return tokenizer(
+        example["query"],
+        truncation=True,
+        padding="max_length",
+        max_length=64
+    )
+
+
+train_dataset = load_csv("data/intent_train.csv")
+valid_dataset = load_csv("data/intent_valid.csv")
+
+train_dataset = train_dataset.map(tokenize_function, batched=True)
+valid_dataset = valid_dataset.map(tokenize_function, batched=True)
+
+train_dataset = train_dataset.remove_columns(["query"])
+valid_dataset = valid_dataset.remove_columns(["query"])
+
+train_dataset.set_format("torch")
+valid_dataset.set_format("torch")
+
+model = AutoModelForSequenceClassification.from_pretrained(
+    MODEL_NAME,
+    num_labels=3,
+    id2label=id2label,
+    label2id=label2id
+)
+
+
+def compute_metrics(eval_pred):
+    logits, labels = eval_pred
+    preds = logits.argmax(axis=-1)
+
+    acc = accuracy_score(labels, preds)
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        labels,
+        preds,
+        average="macro"
+    )
+
+    return {
+        "accuracy": acc,
+        "macro_precision": precision,
+        "macro_recall": recall,
+        "macro_f1": f1
+    }
+
+
+training_args = TrainingArguments(
+    output_dir="./intent_bert_output",
+    evaluation_strategy="epoch",
+    save_strategy="epoch",
+    learning_rate=2e-5,
+    per_device_train_batch_size=16,
+    per_device_eval_batch_size=32,
+    num_train_epochs=4,
+    weight_decay=0.01,
+    warmup_ratio=0.1,
+    logging_steps=50,
+    load_best_model_at_end=True,
+    metric_for_best_model="macro_f1",
+    greater_is_better=True
+)
+
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_dataset,
+    eval_dataset=valid_dataset,
+    tokenizer=tokenizer,
+    compute_metrics=compute_metrics
+)
+
+trainer.train()
+
+trainer.save_model("./intent_bert_model")
+tokenizer.save_pretrained("./intent_bert_model")
+```
+
+------
+
+# 七、推理代码示例
+
+文件名：
+
+```text
+predict_intent.py
+```
+
+代码：
+
+```python
+import torch
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+
+MODEL_PATH = "./intent_bert_model"
+
+id2label = {
+    0: "document",
+    1: "news",
+    2: "guide"
+}
+
+label_name = {
+    "document": "资料类",
+    "news": "资讯类",
+    "guide": "攻略类"
+}
+
+tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
+model = AutoModelForSequenceClassification.from_pretrained(MODEL_PATH)
+model.eval()
+
+
+def predict_intent(query: str):
+    inputs = tokenizer(
+        query,
+        return_tensors="pt",
+        truncation=True,
+        padding="max_length",
+        max_length=64
+    )
+
+    with torch.no_grad():
+        outputs = model(**inputs)
+        logits = outputs.logits
+        probs = torch.softmax(logits, dim=-1)[0]
+
+    pred_id = int(torch.argmax(probs).item())
+    intent = id2label[pred_id]
+    confidence = float(probs[pred_id].item())
+
+    return {
+        "query": query,
+        "intent": intent,
+        "intent_name": label_name[intent],
+        "confidence": confidence
+    }
+
+
+if __name__ == "__main__":
+    test_queries = [
+        "孙尚香一技能是什么",
+        "最新版本更新了什么",
+        "李白怎么玩"
+    ]
+
+    for q in test_queries:
+        print(predict_intent(q))
+```
+
+输出示例：
+
+```json
+{
+  "query": "李白怎么玩",
+  "intent": "guide",
+  "intent_name": "攻略类",
+  "confidence": 0.9821
+}
+```
+
+------
+
+# 八、接入 RAG 系统的方式
+
+## 1. 意图识别服务返回结果
+
+推荐封装成一个独立服务：
+
+```text
+POST /intent/predict
+```
+
+请求：
+
+```json
+{
+  "query": "李白怎么玩"
+}
+```
+
+返回：
+
+```json
+{
+  "intent": "guide",
+  "intent_name": "攻略类",
+  "confidence": 0.9821
+}
+```
+
+------
+
+## 2. Java RAG 系统中的调用位置
+
+可以放在：
+
+```text
+QueryUnderstandingService
+```
+
+例如：
+
+```java
+public QueryUnderstandingResult understand(String query) {
+    IntentResult intentResult = intentClassifierClient.predict(query);
+
+    List<String> rewrittenQueries = queryRewriteService.rewrite(query, intentResult);
+
+    ExtractedInfo extractedInfo = informationExtractor.extract(query, intentResult);
+
+    RetrievalRoute route = retrievalRouter.route(intentResult, extractedInfo);
+
+    return new QueryUnderstandingResult(
+        query,
+        intentResult,
+        rewrittenQueries,
+        extractedInfo,
+        route
+    );
+}
+```
+
+------
+
+# 九、根据意图选择不同检索策略
+
+这是 BERT 意图识别真正有价值的地方。
+
+## 1. 资料类：document
+
+适合查静态知识。
+
+例如：
+
+```text
+孙尚香一技能是什么
+破军属性是什么
+红 buff 作用是什么
+```
+
+检索策略：
+
+```text
+1. 优先检索静态知识库
+2. 向量召回 topK = 20
+3. 关键词召回 topK = 20
+4. RRF 融合
+5. Rerank 取 topK = 5
+6. LLM 严格基于知识库回答
+```
+
+适合的 Prompt：
+
+```text
+请根据以下资料回答用户问题。
+如果资料中没有答案，请回答“知识库中暂未找到相关资料”，不要编造。
+```
+
+------
+
+## 2. 资讯类：news
+
+适合查公告、版本、赛季、活动。
+
+例如：
+
+```text
+最新版本更新了什么
+这个赛季有什么活动
+最近哪些英雄调整了
+```
+
+检索策略：
+
+```text
+1. 优先检索资讯库、公告库、版本更新库
+2. 必须加入时间字段过滤
+3. 优先返回最新内容
+4. 向量召回 topK = 30
+5. 关键词召回 topK = 30
+6. 按发布时间加权
+7. Rerank 取 topK = 5
+```
+
+资讯类建议在知识库中增加字段：
+
+```text
+publish_time
+source
+version
+season
+event_type
+```
+
+排序时可以加入时间权重：
+
+```text
+final_score = 0.7 * rerank_score + 0.3 * time_score
+```
+
+适合的 Prompt：
+
+```text
+请根据最新资讯内容回答用户问题。
+回答时需要说明信息来源时间。
+如果没有找到最新资讯，请明确说明当前知识库没有相关最新信息。
+```
+
+------
+
+## 3. 攻略类：guide
+
+适合查玩法、出装、连招、对线、阵容。
+
+例如：
+
+```text
+李白怎么玩
+孙尚香怎么出装
+打野怎么带节奏
+```
+
+检索策略：
+
+```text
+1. 优先检索攻略库、玩法库、英雄技巧库
+2. Query 改写时扩展玩法相关词
+3. 向量召回 topK = 40
+4. 关键词召回 topK = 20
+5. Rerank 取 topK = 8
+6. LLM 输出结构化步骤
+```
+
+攻略类可以扩展 Query：
+
+```text
+原始 Query：
+李白怎么玩
+
+扩展 Query：
+李白 技能连招
+李白 打野思路
+李白 出装铭文
+李白 团战技巧
+李白 新手攻略
+```
+
+适合的 Prompt：
+
+```text
+请根据攻略资料，按照“技能理解、出装推荐、连招思路、对线/打野技巧、团战打法、注意事项”的结构回答。
+```
+
+------
+
+# 十、低置信度兜底机制
+
+不要完全相信分类结果。建议设置置信度阈值。
+
+```text
+confidence >= 0.75：直接使用预测意图
+0.50 <= confidence < 0.75：使用预测意图，但同时扩大召回范围
+confidence < 0.50：进入 UNKNOWN，走通用混合检索
+```
+
+示例：
+
+```python
+if confidence < 0.5:
+    intent = "unknown"
+```
+
+Java 中可以这样处理：
+
+```java
+if (intentResult.getConfidence() < 0.5) {
+    route = RetrievalRoute.GENERAL_HYBRID;
+} else if (intentResult.getIntent().equals("news")) {
+    route = RetrievalRoute.NEWS_FIRST;
+} else if (intentResult.getIntent().equals("guide")) {
+    route = RetrievalRoute.GUIDE_FIRST;
+} else {
+    route = RetrievalRoute.DOCUMENT_FIRST;
+}
+```
+
+------
+
+# 十一、容易混淆的样本处理
+
+有些 Query 会比较模糊。
+
+## 1. “李白介绍”
+
+可能是资料类，也可能是攻略类。
+
+建议标注为：
+
+```text
+资料类 document
+```
+
+因为“介绍”更偏静态资料。
+
+------
+
+## 2. “李白怎么玩”
+
+标注为：
+
+```text
+攻略类 guide
+```
+
+因为“怎么玩”明显是玩法攻略。
+
+------
+
+## 3. “李白最近改了吗”
+
+标注为：
+
+```text
+资讯类 news
+```
+
+因为“最近”“改了”表示时效信息。
+
+------
+
+## 4. “孙尚香强不强”
+
+这个比较模糊，可能是攻略类，也可能是资讯类。
+
+建议根据系统目标处理：
+
+```text
+如果问当前版本强度 → 资讯类
+如果问玩法强度分析 → 攻略类
+```
+
+可以扩展为四类：
+
+```text
+资料类 document
+资讯类 news
+攻略类 guide
+综合类 general
+```
+
+但你现在只需要三类的话，可以先归到：
+
+```text
+攻略类 guide
+```
+
+------
+
+# 十二、单次识别大概多长时间？
+
+这个和模型大小、硬件、部署方式有关。
+
+以 **BERT-base / MacBERT-base，max_length=64，batch_size=1** 为例：
+
+| 部署环境                     | 单条 Query 识别时间        |
+| ---------------------------- | -------------------------- |
+| 普通 CPU，PyTorch 原生推理   | 30 ms ~ 150 ms             |
+| 较好的 CPU + ONNX Runtime    | 10 ms ~ 50 ms              |
+| CPU + INT8 量化              | 5 ms ~ 30 ms               |
+| 普通 GPU，例如 RTX 3060 / T4 | 3 ms ~ 15 ms               |
+| TinyBERT / 小模型 CPU 推理   | 3 ms ~ 20 ms               |
+| 远程 HTTP 调用模型服务       | 20 ms ~ 200 ms，取决于网络 |
+
+比较实际的估计：
+
+```text
+本地 CPU 部署 BERT-base：单次大约 50 ms 左右
+本地 GPU 部署 BERT-base：单次大约 5 到 15 ms
+ONNX + CPU 优化后：单次大约 10 到 30 ms
+TinyBERT CPU 部署：单次大约 5 到 15 ms
+```
+
+如果你的 RAG 系统本身还要做：
+
+```text
+Query 改写
+Milvus 检索
+Rerank
+LLM 生成
+```
+
+那么 BERT 意图识别的耗时通常不是瓶颈。
+
+整体耗时大概是：
+
+| 模块           | 典型耗时       |
+| -------------- | -------------- |
+| BERT 意图识别  | 5 ms ~ 100 ms  |
+| Embedding 生成 | 20 ms ~ 200 ms |
+| Milvus 检索    | 10 ms ~ 100 ms |
+| Rerank         | 50 ms ~ 500 ms |
+| LLM 生成       | 1 s ~ 10 s     |
+
+所以，意图识别一般只占很小一部分。
+
+------
+
+# 十三、推荐部署方案
+
+## 方案一：Python 模型服务 + Java 调用
+
+这是最简单的方式。
+
+```text
+SpringBoot RAG 系统
+        ↓ HTTP
+Python FastAPI 意图识别服务
+        ↓
+BERT 模型
+```
+
+优点：
+
+```text
+1. 训练和推理都方便
+2. Hugging Face 支持好
+3. 修改模型不影响 Java 主项目
+```
+
+缺点：
+
+```text
+需要额外部署一个 Python 服务
+```
+
+------
+
+## 方案二：导出 ONNX，Java 本地推理
+
+```text
+BERT 模型
+   ↓
+导出 ONNX
+   ↓
+Java 使用 ONNX Runtime 推理
+   ↓
+SpringBoot 内部直接调用
+```
+
+优点：
+
+```text
+1. 不需要 Python 服务
+2. 延迟低
+3. 更适合生产部署
+```
+
+缺点：
+
+```text
+1. ONNX 导出和 tokenizer 处理稍微麻烦
+2. Java 中实现分词需要额外处理
+```
+
+------
+
+## 方案三：使用小模型替代 BERT-base
+
+如果只是三分类，可以使用：
+
+```text
+TinyBERT
+MiniLM
+RoBERTa-small
+```
+
+优点：
+
+```text
+速度更快
+CPU 也能轻松部署
+```
+
+缺点：
+
+```text
+准确率可能略低
+```
+
+但对于“资料类 / 资讯类 / 攻略类”这种意图分类任务，小模型通常已经够用。
+
+------
+
+# 十四、推荐项目结构
+
+```text
+intent-classifier/
+│
+├── data/
+│   ├── intent_train.csv
+│   ├── intent_valid.csv
+│   └── intent_test.csv
+│
+├── scripts/
+│   ├── build_dataset.py
+│   ├── train_intent_bert.py
+│   ├── predict_intent.py
+│   └── export_onnx.py
+│
+├── model/
+│   └── intent_bert_model/
+│
+├── service/
+│   ├── app.py
+│   └── intent_service.py
+│
+├── requirements.txt
+└── README.md
+```
+
+如果接入 Java RAG 项目，可以在 Java 项目中新增：
+
+```text
+src/main/java/com/example/gamerag/intent/
+│
+├── IntentResult.java
+├── IntentType.java
+├── IntentClassifierClient.java
+└── IntentRouteService.java
+```
+
+------
+
+# 十五、RAG 中的最终路由逻辑
+
+可以设计成：
+
+```text
+资料类 document：
+    检索 hero_knowledge、skill_knowledge、item_knowledge、mechanism_knowledge
+
+资讯类 news：
+    检索 update_news、season_news、event_news、announcement_news
+    增加 publish_time 排序
+
+攻略类 guide：
+    检索 hero_guide、build_guide、combo_guide、teamfight_guide
+    增加 Query 扩展
+```
+
+伪代码：
+
+```java
+public RetrievalConfig buildRetrievalConfig(IntentResult intentResult) {
+    switch (intentResult.getIntent()) {
+        case "document":
+            return RetrievalConfig.builder()
+                    .collections(List.of("hero_knowledge", "item_knowledge", "skill_knowledge"))
+                    .denseTopK(20)
+                    .sparseTopK(20)
+                    .rerankTopK(5)
+                    .timeSensitive(false)
+                    .build();
+
+        case "news":
+            return RetrievalConfig.builder()
+                    .collections(List.of("update_news", "event_news", "announcement_news"))
+                    .denseTopK(30)
+                    .sparseTopK(30)
+                    .rerankTopK(5)
+                    .timeSensitive(true)
+                    .sortByTime(true)
+                    .build();
+
+        case "guide":
+            return RetrievalConfig.builder()
+                    .collections(List.of("hero_guide", "build_guide", "combo_guide"))
+                    .denseTopK(40)
+                    .sparseTopK(20)
+                    .rerankTopK(8)
+                    .enableQueryExpansion(true)
+                    .build();
+
+        default:
+            return RetrievalConfig.defaultHybrid();
+    }
+}
+```
+
+------
+
+# 十六、完整落地流程
+
+建议按这个顺序做：
+
+```text
+第一步：确定意图标签
+document / news / guide
+
+第二步：整理训练数据
+每类至少 1000 条 Query
+
+第三步：训练 BERT 三分类模型
+使用 chinese-macbert-base 或 chinese-roberta-wwm-ext
+
+第四步：评估模型
+重点看 macro-F1、混淆矩阵、每类召回率
+
+第五步：加入低置信度兜底
+confidence < 0.5 时走通用检索
+
+第六步：封装推理服务
+FastAPI 或 ONNX Runtime
+
+第七步：接入 Java RAG 系统
+放在 QueryUnderstandingService 前端
+
+第八步：根据意图配置不同检索策略
+资料类、资讯类、攻略类走不同 collection、topK、排序方式
+
+第九步：线上日志回流
+把分类错误的 Query 收集起来继续训练
+```
+
+------
+
+# 十七、最终建议
+
+你的场景里，BERT 意图识别不是最复杂的部分，但它对 RAG 检索质量很关键。
+
+推荐初版采用：
+
+```text
+模型：hfl/chinese-macbert-base
+类别：资料类 / 资讯类 / 攻略类
+max_length：64
+训练数据：每类 1000 条起步
+部署：Python FastAPI 服务
+单次耗时：CPU 约 30~100 ms，GPU 约 5~15 ms
+```
+
+如果后期要上线并降低延迟，再优化为：
+
+```text
+MacBERT-base → TinyBERT / MiniLM
+PyTorch → ONNX Runtime
+FP32 → INT8 量化
+Python 服务 → Java 本地 ONNX 推理
+```
+
+最终在 RAG 中的作用是：
+
+```text
+不是直接回答问题，
+而是判断用户到底想查资料、查资讯，还是查攻略，
+然后决定后续怎么改写 Query、查哪个知识库、召回多少内容、如何排序。
+```
