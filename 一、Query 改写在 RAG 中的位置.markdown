@@ -1,4 +1,697 @@
-下面给出一套**用 T5-large 770M 微调实现 RAG Query 改写**的完整方案。T5 是典型的 encoder-decoder 文本到文本模型，适合把“原始 Query / 多轮上下文”转换成“更适合检索的标准化 Query”。Hugging Face 的 `google-t5/t5-large` 标注为 770M 参数，T5 体系本身将 NLP 任务统一成 text-to-text 形式。([Hugging Face](https://huggingface.co/google-t5/t5-large?utm_source=chatgpt.com))
+可以，直接补你现在这个类里的 `sparseVectorSearch()`。你当前代码中稀疏检索方法只是占位，`sparseVectorSearch` 直接返回空列表，所以只要把这一部分替换掉，并补充少量配置即可。
+
+下面按你当前 Milvus 字段设计来实现：
+
+```text
+id
+title
+chunk_id
+content
+content_dense_vector
+content_sparse_vector
+doc_id
+```
+
+其中：
+
+```text
+content_dense_vector  → 稠密向量字段
+content_sparse_vector → 稀疏向量字段
+```
+
+------
+
+# 一、先说明两种稀疏检索方式
+
+Milvus 稀疏检索有两种常见做法：
+
+| 方式                              | 查询时传什么         | 适合场景                                |
+| --------------------------------- | -------------------- | --------------------------------------- |
+| Milvus BM25 Function 自动稀疏向量 | 直接传原始文本 Query | 适合关键词检索、全文检索                |
+| BGE-M3 / SPLADE 生成稀疏向量      | 传 `SparseFloatVec`  | 适合模型生成的 learned sparse retrieval |
+
+你之前说的是“Milvus 自动生成稀疏向量”，所以这里优先采用 **Milvus BM25 Function + EmbeddedText** 的方式。
+
+Milvus 的 BM25 Function 会把文本字段转换成稀疏向量，并且查询时也可以直接传入原始文本，Milvus 会自动把查询文本转换成稀疏向量进行检索。官方 Java 示例里也是用 `new EmbeddedText("query text")` 作为查询数据。([Milvus](https://milvus.io/docs/full-text-search.md))
+
+------
+
+# 二、需要补充的 import
+
+在你的 `MilvusVectorRetrievalService` 顶部增加：
+
+```java
+import io.milvus.v2.service.vector.request.data.EmbeddedText;
+```
+
+如果你后续想用 BGE-M3 自己生成稀疏向量，还需要：
+
+```java
+import io.milvus.v2.service.vector.request.data.SparseFloatVec;
+```
+
+但本次 BM25 自动稀疏检索只需要 `EmbeddedText`。
+
+------
+
+# 三、替换 sparseVectorSearch 方法
+
+把你原来的这个方法：
+
+```java
+private List<SearchHit> sparseVectorSearch(String query) {
+    long start = System.currentTimeMillis();
+    log.debug("稀疏向量检索暂未实现，返回空列表，query='{}'，耗时: {} ms", query, System.currentTimeMillis() - start);
+    return List.of();
+}
+```
+
+替换成下面完整实现：
+
+```java
+/**
+ * 稀疏向量检索。
+ *
+ * <p>适用于 Milvus 内置 BM25 Function 自动生成的稀疏向量字段。
+ * <p>查询时不需要自己生成 sparse vector，而是直接传入 EmbeddedText，
+ * Milvus 会使用和入库时相同的 Analyzer + BM25 Function 将查询文本转换为稀疏向量。
+ *
+ * @param query 原始查询文本
+ * @return 稀疏检索结果列表
+ */
+private List<SearchHit> sparseVectorSearch(String query) {
+    long methodStart = System.currentTimeMillis();
+
+    if (query == null || query.isBlank()) {
+        return List.of();
+    }
+
+    try {
+        String collectionName = properties.getMilvus().getCollection();
+        String sparseField = properties.getMilvus().getSparseVectorField();
+
+        if (sparseField == null || sparseField.isBlank()) {
+            log.warn("稀疏检索失败：未配置 sparseVectorField");
+            return List.of();
+        }
+
+        /*
+         * 注意：
+         * 如果 content_sparse_vector 是 BM25 Function 自动生成的字段，
+         * outputFields 里不要包含 content_sparse_vector 本身。
+         *
+         * Milvus 对 BM25 生成的 sparse 字段通常不允许直接输出。
+         */
+        List<String> outputFields = buildSparseOutputFields();
+
+        /*
+         * BM25 稀疏检索搜索参数。
+         *
+         * drop_ratio_search 表示搜索时忽略一部分低权重词项。
+         * 如果你不确定 SDK 版本是否支持该参数，可以先用空 Map。
+         */
+        Map<String, Object> searchParams = new HashMap<>();
+        Double dropRatioSearch = properties.getMilvus().getSparseDropRatioSearch();
+        if (dropRatioSearch != null && dropRatioSearch > 0) {
+            searchParams.put("drop_ratio_search", dropRatioSearch);
+        }
+
+        SearchReq searchReq = SearchReq.builder()
+                .collectionName(collectionName)
+                .annsField(sparseField)
+                .data(Collections.singletonList(new EmbeddedText(query)))
+                .topK(properties.getMilvus().getSparseTopK())
+                .outputFields(outputFields)
+                .consistencyLevel(ConsistencyLevel.valueOf(properties.getMilvus().getConsistencyLevel()))
+                .searchParams(searchParams)
+                .build();
+
+        long searchStart = System.currentTimeMillis();
+        SearchResp response = milvusClient.search(searchReq);
+        long searchCost = System.currentTimeMillis() - searchStart;
+
+        long parseStart = System.currentTimeMillis();
+        List<SearchHit> hits = parseSearchResp(response, RecallChannel.SPARSE_VECTOR);
+        long parseCost = System.currentTimeMillis() - parseStart;
+
+        long totalCost = System.currentTimeMillis() - methodStart;
+        log.info("稀疏检索总耗时: {} ms (Milvus搜索: {}ms, 解析: {}ms)，命中数: {}",
+                totalCost, searchCost, parseCost, hits.size());
+
+        return hits;
+    } catch (Exception e) {
+        log.warn("稀疏向量检索失败, query='{}': {}", query, e.getMessage(), e);
+        return List.of();
+    }
+}
+```
+
+------
+
+# 四、增加 buildSparseOutputFields 方法
+
+把下面这个辅助方法加到 `MilvusVectorRetrievalService` 里，建议放在 `parseSearchResp()` 前面或后面都可以。
+
+```java
+/**
+ * 构建稀疏检索的输出字段。
+ *
+ * <p>如果 content_sparse_vector 是 Milvus BM25 Function 自动生成字段，
+ * 不建议放入 outputFields，否则部分 Milvus 版本会报错。
+ *
+ * @return 稀疏检索可以安全返回的字段列表
+ */
+private List<String> buildSparseOutputFields() {
+    List<String> configuredFields = properties.getMilvus().getOutputFields();
+    if (configuredFields == null || configuredFields.isEmpty()) {
+        return List.of(
+                properties.getMilvus().getPrimaryKeyField(),
+                properties.getMilvus().getTitleField(),
+                properties.getMilvus().getChunkIdField(),
+                properties.getMilvus().getTextField()
+        );
+    }
+
+    String sparseField = properties.getMilvus().getSparseVectorField();
+
+    List<String> outputFields = new ArrayList<>();
+    for (String field : configuredFields) {
+        if (field == null || field.isBlank()) {
+            continue;
+        }
+
+        /*
+         * BM25 自动生成的 sparse vector 字段不能作为普通字段输出。
+         */
+        if (field.equals(sparseField)) {
+            continue;
+        }
+
+        outputFields.add(field);
+    }
+
+    return TextUtils.distinctNonBlank(outputFields, outputFields.size());
+}
+```
+
+------
+
+# 五、RagProperties 需要补充的配置字段
+
+你的代码里已经有：
+
+```java
+properties.getMilvus().isSparseSearchEnabled()
+```
+
+说明配置类里大概率已经有 `sparseSearchEnabled`。还需要补充这些字段：
+
+```java
+private String sparseVectorField;
+private Integer sparseTopK;
+private Double sparseDropRatioSearch;
+```
+
+示例：
+
+```java
+@Data
+@ConfigurationProperties(prefix = "rag")
+public class RagProperties {
+
+    private Milvus milvus = new Milvus();
+
+    @Data
+    public static class Milvus {
+
+        private String endpoint;
+        private String token;
+        private String database;
+        private String collection;
+
+        private String primaryKeyField = "id";
+        private String titleField = "title";
+        private String chunkIdField = "chunk_id";
+        private String textField = "content";
+        private String docIdField = "doc_id";
+
+        private String denseVectorField = "content_dense_vector";
+        private String sparseVectorField = "content_sparse_vector";
+
+        private boolean denseSearchEnabled = true;
+        private boolean sparseSearchEnabled = true;
+
+        private Integer denseTopK = 20;
+        private Integer sparseTopK = 20;
+
+        private Double sparseDropRatioSearch = 0.0;
+
+        private String consistencyLevel = "BOUNDED";
+
+        private List<String> outputFields = List.of(
+                "id",
+                "title",
+                "chunk_id",
+                "content",
+                "doc_id"
+        );
+    }
+}
+```
+
+------
+
+# 六、application.yml 配置示例
+
+你可以这样配置：
+
+```yaml
+rag:
+  milvus:
+    endpoint: http://localhost:19530
+    token: root:Milvus
+    database: default
+    collection: game_knowledge
+
+    primary-key-field: id
+    title-field: title
+    chunk-id-field: chunk_id
+    text-field: content
+    doc-id-field: doc_id
+
+    dense-vector-field: content_dense_vector
+    sparse-vector-field: content_sparse_vector
+
+    dense-search-enabled: true
+    sparse-search-enabled: true
+
+    dense-top-k: 20
+    sparse-top-k: 20
+
+    sparse-drop-ratio-search: 0.0
+
+    consistency-level: BOUNDED
+
+    output-fields:
+      - id
+      - title
+      - chunk_id
+      - content
+      - doc_id
+```
+
+注意：不要把下面这个字段放到 `output-fields` 里：
+
+```yaml
+- content_sparse_vector
+```
+
+因为如果它是 BM25 Function 自动生成的稀疏字段，Milvus 通常不允许直接输出该字段。官方文档也说明 BM25 Function 生成的 sparse 字段不能作为普通输出字段返回。([Milvus](https://milvus.io/docs/full-text-search.md))
+
+------
+
+# 七、完整修改后的关键代码片段
+
+你的 `MilvusVectorRetrievalService` 主要改成这样。
+
+## 1. import 部分增加
+
+```java
+import io.milvus.v2.service.vector.request.data.EmbeddedText;
+```
+
+------
+
+## 2. sparseVectorSearch 完整实现
+
+```java
+private List<SearchHit> sparseVectorSearch(String query) {
+    long methodStart = System.currentTimeMillis();
+
+    if (query == null || query.isBlank()) {
+        return List.of();
+    }
+
+    try {
+        String collectionName = properties.getMilvus().getCollection();
+        String sparseField = properties.getMilvus().getSparseVectorField();
+
+        if (sparseField == null || sparseField.isBlank()) {
+            log.warn("稀疏检索失败：未配置 sparseVectorField");
+            return List.of();
+        }
+
+        List<String> outputFields = buildSparseOutputFields();
+
+        Map<String, Object> searchParams = new HashMap<>();
+        Double dropRatioSearch = properties.getMilvus().getSparseDropRatioSearch();
+        if (dropRatioSearch != null && dropRatioSearch > 0) {
+            searchParams.put("drop_ratio_search", dropRatioSearch);
+        }
+
+        SearchReq searchReq = SearchReq.builder()
+                .collectionName(collectionName)
+                .annsField(sparseField)
+                .data(Collections.singletonList(new EmbeddedText(query)))
+                .topK(properties.getMilvus().getSparseTopK())
+                .outputFields(outputFields)
+                .consistencyLevel(ConsistencyLevel.valueOf(properties.getMilvus().getConsistencyLevel()))
+                .searchParams(searchParams)
+                .build();
+
+        long searchStart = System.currentTimeMillis();
+        SearchResp response = milvusClient.search(searchReq);
+        long searchCost = System.currentTimeMillis() - searchStart;
+
+        long parseStart = System.currentTimeMillis();
+        List<SearchHit> hits = parseSearchResp(response, RecallChannel.SPARSE_VECTOR);
+        long parseCost = System.currentTimeMillis() - parseStart;
+
+        long totalCost = System.currentTimeMillis() - methodStart;
+        log.info("稀疏检索总耗时: {} ms (Milvus搜索: {}ms, 解析: {}ms)，命中数: {}",
+                totalCost, searchCost, parseCost, hits.size());
+
+        return hits;
+    } catch (Exception e) {
+        log.warn("稀疏向量检索失败, query='{}': {}", query, e.getMessage(), e);
+        return List.of();
+    }
+}
+```
+
+------
+
+## 3. buildSparseOutputFields 辅助方法
+
+```java
+private List<String> buildSparseOutputFields() {
+    List<String> configuredFields = properties.getMilvus().getOutputFields();
+    if (configuredFields == null || configuredFields.isEmpty()) {
+        return List.of(
+                properties.getMilvus().getPrimaryKeyField(),
+                properties.getMilvus().getTitleField(),
+                properties.getMilvus().getChunkIdField(),
+                properties.getMilvus().getTextField()
+        );
+    }
+
+    String sparseField = properties.getMilvus().getSparseVectorField();
+
+    List<String> outputFields = new ArrayList<>();
+    for (String field : configuredFields) {
+        if (field == null || field.isBlank()) {
+            continue;
+        }
+        if (field.equals(sparseField)) {
+            continue;
+        }
+        outputFields.add(field);
+    }
+
+    return TextUtils.distinctNonBlank(outputFields, outputFields.size());
+}
+```
+
+------
+
+# 八、Milvus Collection 必须满足的条件
+
+你的 Milvus Collection 需要这样设计：
+
+```text
+content 字段：
+    DataType.VarChar
+    enable_analyzer = true
+
+content_sparse_vector 字段：
+    DataType.SparseFloatVector
+
+BM25 Function：
+    input_field_names = ["content"]
+    output_field_names = ["content_sparse_vector"]
+```
+
+Milvus 文档中要求 BM25 全文检索至少包含文本字段、稀疏向量字段和 BM25 Function；文本字段需要启用 analyzer，BM25 Function 会把文本转成稀疏向量。([Milvus](https://milvus.io/docs/full-text-search.md))
+
+示例 Collection Schema：
+
+```java
+import io.milvus.common.clientenum.FunctionType;
+import io.milvus.v2.common.DataType;
+import io.milvus.v2.common.IndexParam;
+import io.milvus.v2.service.collection.request.AddFieldReq;
+import io.milvus.v2.service.collection.request.CreateCollectionReq;
+import io.milvus.v2.service.collection.request.CreateCollectionReq.Function;
+
+import java.util.*;
+
+CreateCollectionReq.CollectionSchema schema = CreateCollectionReq.CollectionSchema.builder()
+        .enableDynamicField(false)
+        .build();
+
+schema.addField(AddFieldReq.builder()
+        .fieldName("id")
+        .dataType(DataType.VarChar)
+        .isPrimaryKey(true)
+        .maxLength(64)
+        .build());
+
+schema.addField(AddFieldReq.builder()
+        .fieldName("title")
+        .dataType(DataType.VarChar)
+        .maxLength(512)
+        .build());
+
+schema.addField(AddFieldReq.builder()
+        .fieldName("chunk_id")
+        .dataType(DataType.VarChar)
+        .maxLength(64)
+        .build());
+
+schema.addField(AddFieldReq.builder()
+        .fieldName("content")
+        .dataType(DataType.VarChar)
+        .maxLength(65535)
+        .enableAnalyzer(true)
+        .build());
+
+schema.addField(AddFieldReq.builder()
+        .fieldName("doc_id")
+        .dataType(DataType.VarChar)
+        .maxLength(64)
+        .build());
+
+schema.addField(AddFieldReq.builder()
+        .fieldName("content_dense_vector")
+        .dataType(DataType.FloatVector)
+        .dimension(1024)
+        .build());
+
+schema.addField(AddFieldReq.builder()
+        .fieldName("content_sparse_vector")
+        .dataType(DataType.SparseFloatVector)
+        .build());
+
+schema.addFunction(Function.builder()
+        .functionType(FunctionType.BM25)
+        .name("content_bm25_func")
+        .inputFieldNames(Collections.singletonList("content"))
+        .outputFieldNames(Collections.singletonList("content_sparse_vector"))
+        .build());
+```
+
+稀疏向量字段不需要设置维度，Milvus 支持 `SPARSE_FLOAT_VECTOR`，并且稀疏向量字段可以和稠密向量字段放在同一个 Collection 中做混合检索。([Milvus](https://milvus.io/docs/sparse_vector.md))
+
+------
+
+# 九、稀疏向量索引配置
+
+BM25 Function 对应的稀疏字段需要建索引。
+
+示例：
+
+```java
+Map<String, Object> sparseIndexParams = new HashMap<>();
+sparseIndexParams.put("inverted_index_algo", "DAAT_MAXSCORE");
+sparseIndexParams.put("bm25_k1", 1.2);
+sparseIndexParams.put("bm25_b", 0.75);
+
+List<IndexParam> indexes = new ArrayList<>();
+
+indexes.add(IndexParam.builder()
+        .fieldName("content_sparse_vector")
+        .indexType(IndexParam.IndexType.AUTOINDEX)
+        .metricType(IndexParam.MetricType.BM25)
+        .extraParams(sparseIndexParams)
+        .build());
+```
+
+如果你不是 BM25 Function，而是自己插入 BGE-M3 / SPLADE 生成的 sparse vector，那么稀疏索引通常使用：
+
+```text
+SPARSE_INVERTED_INDEX
+```
+
+或者：
+
+```text
+SPARSE_WAND
+```
+
+手动 sparse vector 场景下，Milvus 稀疏向量目前主要支持 `IP` 作为相似度度量；BM25 Function 场景下则使用 `BM25` metric。([Milvus](https://milvus.io/docs/sparse_vector.md))
+
+------
+
+# 十、如果你不是 BM25，而是 BGE-M3 生成 sparse vector
+
+如果你离线入库时的 `content_sparse_vector` 不是 Milvus BM25 Function 自动生成，而是 BGE-M3 生成的稀疏向量，那么上面的 `EmbeddedText` 不能用。
+
+这时应该这样写：
+
+```java
+import io.milvus.v2.service.vector.request.data.SparseFloatVec;
+import java.util.SortedMap;
+import java.util.TreeMap;
+```
+
+实现方式：
+
+```java
+private List<SearchHit> sparseVectorSearch(String query) {
+    long methodStart = System.currentTimeMillis();
+
+    if (query == null || query.isBlank()) {
+        return List.of();
+    }
+
+    try {
+        long embedStart = System.currentTimeMillis();
+
+        /*
+         * 这里需要你自己实现 bgeSparseEmbeddingClient.sparseEmbed(query)
+         * 返回格式必须是 SortedMap<Long, Float>
+         *
+         * 例如：
+         * {
+         *   101L: 0.83f,
+         *   20345L: 0.41f,
+         *   99871L: 0.12f
+         * }
+         */
+        SortedMap<Long, Float> sparseVector = bgeSparseEmbeddingClient.sparseEmbed(query);
+
+        long embedCost = System.currentTimeMillis() - embedStart;
+
+        if (sparseVector == null || sparseVector.isEmpty()) {
+            log.warn("BGE-M3 稀疏向量为空，query='{}'", query);
+            return List.of();
+        }
+
+        Map<String, Object> searchParams = new HashMap<>();
+        Double dropRatioSearch = properties.getMilvus().getSparseDropRatioSearch();
+        if (dropRatioSearch != null && dropRatioSearch > 0) {
+            searchParams.put("drop_ratio_search", dropRatioSearch);
+        }
+
+        SearchReq searchReq = SearchReq.builder()
+                .collectionName(properties.getMilvus().getCollection())
+                .annsField(properties.getMilvus().getSparseVectorField())
+                .data(Collections.singletonList(new SparseFloatVec(sparseVector)))
+                .topK(properties.getMilvus().getSparseTopK())
+                .outputFields(buildSparseOutputFields())
+                .consistencyLevel(ConsistencyLevel.valueOf(properties.getMilvus().getConsistencyLevel()))
+                .searchParams(searchParams)
+                .build();
+
+        long searchStart = System.currentTimeMillis();
+        SearchResp response = milvusClient.search(searchReq);
+        long searchCost = System.currentTimeMillis() - searchStart;
+
+        List<SearchHit> hits = parseSearchResp(response, RecallChannel.SPARSE_VECTOR);
+
+        log.info("BGE-M3 稀疏检索总耗时: {} ms (SparseEmbedding: {}ms, Milvus搜索: {}ms)，命中数: {}",
+                System.currentTimeMillis() - methodStart,
+                embedCost,
+                searchCost,
+                hits.size());
+
+        return hits;
+    } catch (Exception e) {
+        log.warn("BGE-M3 稀疏向量检索失败, query='{}': {}", query, e.getMessage(), e);
+        return List.of();
+    }
+}
+```
+
+Milvus Java SDK 的多向量检索示例中，`SparseFloatVec` 构造参数就是 `SortedMap`，用于 `SparseFloatVector` 字段检索。([Milvus](https://milvus.io/api-reference/java/v2.4.x/v2/Vector/hybridSearch.md))
+
+------
+
+# 十一、你当前项目推荐采用的最终版本
+
+结合你之前的字段描述：
+
+```text
+content_dense_vector
+content_sparse_vector
+```
+
+以及你说的“自动生成 Milvus 稀疏向量”，推荐你用这个版本：
+
+```java
+.data(Collections.singletonList(new EmbeddedText(query)))
+.annsField(properties.getMilvus().getSparseVectorField())
+```
+
+也就是：
+
+```text
+原始 Query 文本
+    ↓
+EmbeddedText
+    ↓
+Milvus Analyzer
+    ↓
+BM25 Function
+    ↓
+content_sparse_vector 检索
+    ↓
+返回关键词相关结果
+```
+
+最终召回阶段就是：
+
+```text
+denseVectorSearch(query)
+    → 语义召回
+
+sparseVectorSearch(query)
+    → 关键词 / 精确词召回
+
+RRF 融合
+    → 综合排序
+
+Reranker 精排
+    → 最终 topK
+```
+
+这样你的 RAG 检索就同时具备：
+
+```text
+稠密检索：解决语义相似问题
+稀疏检索：解决关键词、专有名词、技能名、装备名、版本号命中问题
+```
+
+例如：
+
+```text
+“孙尚香一技能”
+“影刃属性”
+“S36 赛季更新”
+“红 buff 刷新时间”
+```
+
+这类 Query，稀疏检索通常会比单纯 dense 检索更稳。下面给出一套**用 T5-large 770M 微调实现 RAG Query 改写**的完整方案。T5 是典型的 encoder-decoder 文本到文本模型，适合把“原始 Query / 多轮上下文”转换成“更适合检索的标准化 Query”。Hugging Face 的 `google-t5/t5-large` 标注为 770M 参数，T5 体系本身将 NLP 任务统一成 text-to-text 形式。([Hugging Face](https://huggingface.co/google-t5/t5-large?utm_source=chatgpt.com))
 
 需要注意：原版 `google-t5/t5-large` 的模型卡列出的主要语言是 English、French、Romanian、German，不是专门中文模型。中文 RAG 场景可以复用下面流程，但更建议换成 **mT5-large、中文 T5、Mengzi-T5、CPM/T5 类中文生成模型**。([Hugging Face](https://huggingface.co/google-t5/t5-large/blame/main/README.md?utm_source=chatgpt.com))
 
